@@ -77,4 +77,5 @@ frame.write_text(f)
 mod.write_text(m)
 new.write_text((Path(__file__).parent / 'rowlet_watch.rs').read_text())
 print('Rowlet Watch V5 dry-run reset gate added to PokeReader.')
-print('Reset decisions are diagnostic only. No game in
+print("Dry run only; no buttons sent.")
+
