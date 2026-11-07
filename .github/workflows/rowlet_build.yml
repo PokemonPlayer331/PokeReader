@@ -1,0 +1,32 @@
+
+name: Build Rowlet Watch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply Rowlet patch
+        run: python3 patch/apply_patch.py .
+
+      - name: Compile
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            zaksabeast/devkitarm-rust make
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-watch-plugin
+          path: out/default.3gx
+          if-no-files-found: error
