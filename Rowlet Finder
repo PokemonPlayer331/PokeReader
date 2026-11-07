@@ -1,0 +1,33 @@
+
+name: Build Rowlet Watch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download project files
+        uses: actions/checkout@v4
+
+      - name: Install Rowlet detector
+        run: python3 patch/apply_patch.py .
+
+      - name: Compile 3DS plugin
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            zaksabeast/devkitarm-rust make
+
+      - name: Save compiled plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-watch-plugin
+          path: out/default.3gx
+          if-no-files-found: error
