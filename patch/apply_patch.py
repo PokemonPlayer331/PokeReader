@@ -53,7 +53,7 @@ try:
     anchor = '        Gen7View::Box => draw_pkx(&reader.box_pkm(), PkxType::Tame),'
     insert = '''        Gen7View::RowletWatch => {
             let w = &state.rowlet_watch;
-            pnp::println!("ROWLET WATCH v4");
+            pnp::println!("ROWLET WATCH v5");
             pnp::println!("{}", w.phase.label());
             pnp::println!("{}", w.message);
             pnp::println!("TSV: {}", w.tsv);
@@ -61,7 +61,7 @@ try:
             pnp::println!("PSV: {}", w.psv);
             pnp::println!("Stable frames: {}", w.frames);
             pnp::println!("Seen: {}", w.count);
-            pnp::println!("Reset output: OFF");
+            pnp::println!("Reset buttons: OFF");
         },'''
     f = patch(f, anchor, anchor + '\n' + insert)
     if f.count('    run_frame(reader)\n}') != 2:
@@ -76,5 +76,5 @@ except ValueError as err:
 frame.write_text(f)
 mod.write_text(m)
 new.write_text((Path(__file__).parent / 'rowlet_watch.rs').read_text())
-print('Rowlet Watch diagnostic menu added to PokeReader.')
-print('Automatic soft resetting and button inputs remain DISABLED.')
+print('Rowlet Watch V5 dry-run reset gate added to PokeReader.')
+print('Reset decisions are diagnostic only. No game in
