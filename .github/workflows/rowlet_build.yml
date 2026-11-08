@@ -1,5 +1,5 @@
 
-name: Build Rowlet AUTO v10.5 Standalone Test
+name: Build Rowlet AUTO v10.5.1 MAIN MENU STATUS
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ jobs:
       - name: Apply Rowlet Watch
         run: python3 patch/apply_patch.py .
 
-      - name: Patch standalone guarded movement test
+      - name: Patch standalone movement test
         shell: bash
         run: |
           cat > /tmp/v105.py <<'PY'
@@ -31,91 +31,110 @@ jobs:
               count = s.count(old)
               if count != 1:
                   raise RuntimeError(
-                      f'{path}: expected one match, got {count}: {old!r}'
+                      f'{path}: expected one match, '
+                      f'got {count}: {old!r}'
                   )
               p.write_text(s.replace(old, new, 1))
 
-          # Try writable HID mapping, fall back to original permissions.
-          edit('3gx/sources/main.c',
-          '''    u32 my_perm = has_write_perm ? MEMPERM_READ | MEMPERM_WRITE : MEMPERM_READ;
+          # Attempt writable HID mapping; fall back
+          # to original read-only permissions.
+          edit(
+              '3gx/sources/main.c',
+              '''    u32 my_perm = has_write_perm ? MEMPERM_READ | MEMPERM_WRITE : MEMPERM_READ;
               // Mimic the game's permissions
               return svcMapMemoryBlock(memblock_handle, addr, my_perm, MEMPERM_DONTCARE);''',
-          '''    u32 my_perm = has_write_perm ? MEMPERM_READ | MEMPERM_WRITE : MEMPERM_READ;
+              '''    u32 my_perm = has_write_perm ? MEMPERM_READ | MEMPERM_WRITE : MEMPERM_READ;
               if (!has_write_perm) {
-                  Result writable = svcMapMemoryBlock(memblock_handle, addr,
-                      MEMPERM_READ | MEMPERM_WRITE, MEMPERM_DONTCARE);
+                  Result writable = svcMapMemoryBlock(
+                      memblock_handle, addr,
+                      MEMPERM_READ | MEMPERM_WRITE,
+                      MEMPERM_DONTCARE
+                  );
                   if (R_SUCCEEDED(writable)) return writable;
               }
-              return svcMapMemoryBlock(memblock_handle, addr, my_perm, MEMPERM_DONTCARE);''')
+              return svcMapMemoryBlock(
+                  memblock_handle, addr, my_perm,
+                  MEMPERM_DONTCARE
+              );'''
+          )
 
-          # Frame-based injection, no background thread.
+          # No background threads or physical-memory aliases.
           p = root / '3gx/sources/hid.c'
           s = p.read_text()
+
           s += '''
-          /* V10.5: guarded writable HID test. */
           static volatile u32 rowlet_keys = 0;
           static u32 rowlet_status = 0;
 
           void rowlet_inject(u32 bits) {
-            rowlet_keys = bits & (KEY_DUP | KEY_A);
+              rowlet_keys = bits & (KEY_DUP | KEY_A);
           }
 
           u32 rowlet_input_status(void) {
-            return rowlet_status;
+              return rowlet_status;
           }
 
           void rowlet_pump(void) {
-            if (!g_key_addr) {
-              rowlet_status = 0;
-              return;
-            }
+              if (!g_key_addr) {
+                  rowlet_status = 0;
+                  return;
+              }
 
-            MemInfo mi;
-            PageInfo pi;
+              MemInfo mi;
+              PageInfo pi;
 
-            if (R_FAILED(svcQueryMemory(
-                &mi, &pi, (u32)g_key_addr))) {
-              rowlet_status = 1;
-              return;
-            }
+              if (R_FAILED(svcQueryMemory(
+                  &mi, &pi, (u32)g_key_addr
+              ))) {
+                  rowlet_status = 1;
+                  return;
+              }
 
-            if (!(mi.perm & MEMPERM_WRITE)) {
-              rowlet_status = 1;
-              return;
-            }
+              if (!(mi.perm & MEMPERM_WRITE)) {
+                  rowlet_status = 1;
+                  return;
+              }
 
-            rowlet_status = 2;
+              rowlet_status = 2;
 
-            if (rowlet_keys) {
-              *g_key_addr |= rowlet_keys;
-              rowlet_status = 3;
-            }
+              if (rowlet_keys) {
+                  *g_key_addr |= rowlet_keys;
+                  rowlet_status = 3;
+              }
           }
           '''
+
           p.write_text(s)
 
           p = root / '3gx/includes/hid.h'
-          p.write_text(p.read_text() + '''
+          p.write_text(
+              p.read_text() +
+              '''
           void rowlet_inject(u32 bits);
           u32 rowlet_input_status(void);
           void rowlet_pump(void);
-          ''')
+          '''
+          )
 
           edit(
               '3gx/sources/main.c',
               '        scan_input();\n        run_frame();',
-              '        scan_input();\n        run_frame();\n        rowlet_pump();'
+              '        scan_input();\n'
+              '        run_frame();\n'
+              '        rowlet_pump();'
           )
 
           edit(
               '3gx/sources/pnp.c',
               'u32 host_just_pressed()\n',
               '''void host_rowlet_inject(u32 keys) {
-            rowlet_inject(keys);
+              rowlet_inject(keys);
           }
+
           u32 host_rowlet_status() {
-            return rowlet_input_status();
+              return rowlet_input_status();
           }
+
           u32 host_just_pressed()
           '''
           )
@@ -134,6 +153,7 @@ jobs:
               pub fn host_rowlet_status() -> u32;'''
           )
 
+          # Standalone automation state machine.
           auto = r'''
           use super::rowlet_watch::{Phase, Watch};
           use crate::pnp::{self, Button};
@@ -143,19 +163,32 @@ jobs:
 
           #[derive(Clone, Copy, PartialEq, Eq)]
           pub enum Step {
-              Off, Walk, Dialog, Check, Done, Shiny, Halt
+              Off,
+              Walk,
+              Dialog,
+              Check,
+              Done,
+              Shiny,
+              Halt,
           }
 
           impl Step {
               pub fn label(self) -> &'static str {
                   match self {
-                      Self::Off => "OFF: B+SELECT to arm",
-                      Self::Walk => "TEST: D-PAD UP",
-                      Self::Dialog => "TEST: sending A",
-                      Self::Check => "TEST: checking Rowlet",
-                      Self::Done => "DRY RUN DONE: non-shiny",
-                      Self::Shiny => "SHINY: STOPPED",
-                      Self::Halt => "STOPPED: verify console",
+                      Self::Off =>
+                          "OFF: B+SELECT",
+                      Self::Walk =>
+                          "TEST: D-PAD UP",
+                      Self::Dialog =>
+                          "TEST: sending A",
+                      Self::Check =>
+                          "TEST: checking Rowlet",
+                      Self::Done =>
+                          "DRY RUN DONE",
+                      Self::Shiny =>
+                          "SHINY: STOPPED",
+                      Self::Halt =>
+                          "STOPPED: check game",
                   }
               }
           }
@@ -171,7 +204,7 @@ jobs:
                   Self {
                       step: Step::Off,
                       frames: 0,
-                      debounce: 0
+                      debounce: 0,
                   }
               }
 
@@ -208,7 +241,7 @@ jobs:
                       self.set(Step::Halt);
                   }
 
-                  let mut keys = 0;
+                  let mut keys: u32 = 0;
 
                   match self.step {
                       Step::Walk => {
@@ -243,10 +276,12 @@ jobs:
                       _ => {}
                   }
 
-                  self.frames = self.frames.saturating_add(1);
+                  self.frames =
+                      self.frames.saturating_add(1);
 
                   unsafe {
-                      crate::pnp::bindings::host_rowlet_inject(keys);
+                      crate::pnp::bindings::
+                          host_rowlet_inject(keys);
                   }
               }
           }
@@ -272,45 +307,93 @@ jobs:
           edit(
               'reader_core/src/gen7/frame.rs',
               '    rowlet_watch: Watch,',
-              '    rowlet_watch: Watch,\n    rowlet_auto: Auto,'
+              '    rowlet_watch: Watch,\n'
+              '    rowlet_auto: Auto,'
           )
 
           edit(
               'reader_core/src/gen7/frame.rs',
               '        rowlet_watch: Watch::new(),',
-              '        rowlet_watch: Watch::new(),\n        rowlet_auto: Auto::new(),'
+              '        rowlet_watch: Watch::new(),\n'
+              '        rowlet_auto: Auto::new(),'
           )
 
           edit(
               'reader_core/src/gen7/frame.rs',
               '    state.sfmt.reinit_if_needed(reader.init_seed());',
-              '    if is_ultra_sun { state.rowlet_auto.tick(&state.rowlet_watch); }\n'
-              '    state.sfmt.reinit_if_needed(reader.init_seed());'
+              '''    if is_ultra_sun {
+                  state.rowlet_auto.tick(&state.rowlet_watch);
+              }
+              state.sfmt.reinit_if_needed(reader.init_seed());'''
           )
 
+          # Keep Rowlet Watch information available.
           edit(
               'reader_core/src/gen7/frame.rs',
               'pnp::println!("ROWLET WATCH v5");',
-              'pnp::println!("ROWLET AUTO v10.5 TEST");'
+              'pnp::println!("ROWLET AUTO v10.5.1");'
           )
 
           edit(
               'reader_core/src/gen7/frame.rs',
               '            pnp::println!("Reset buttons: OFF");',
               '''            pnp::println!("MODE: DRY RUN / NO RESET");
-                      pnp::println!("AUTO: {}", state.rowlet_auto.step.label());
-                      let input = unsafe { crate::pnp::bindings::host_rowlet_status() };
-                      pnp::println!("INPUT: {}", match input {
-                          0 => "UNMAPPED",
-                          1 => "READ ONLY - BLOCKED",
-                          2 => "WRITABLE",
-                          3 => "INPUT ATTEMPTED",
-                          _ => "UNKNOWN",
-                      });'''
+                          pnp::println!(
+                              "AUTO: {}",
+                              state.rowlet_auto.step.label()
+                          );
+                          let input = unsafe {
+                              crate::pnp::bindings::
+                                  host_rowlet_status()
+                          };
+                          pnp::println!("INPUT: {}", match input {
+                              0 => "UNMAPPED",
+                              1 => "READ ONLY - BLOCKED",
+                              2 => "WRITABLE",
+                              3 => "INPUT ATTEMPTED",
+                              _ => "UNKNOWN",
+                          });'''
           )
 
-          print("V10.5 standalone dry-run test patched.")
+          # NEW: Display status on PokeReader's MAIN MENU.
+          # This avoids needing to enter Rowlet Watch
+          # while rehid is enabled.
+          edit(
+              'reader_core/src/gen7/frame.rs',
+              '            state.main_menu.draw();',
+              '''            state.main_menu.draw();
+
+                          if is_ultra_sun {
+                              pnp::println!("ROWLET v10.5.1 DRY");
+                              pnp::println!("B+SELECT: START/STOP");
+                              pnp::println!(
+                                  "AUTO: {}",
+                                  state.rowlet_auto.step.label()
+                              );
+
+                              let input = unsafe {
+                                  crate::pnp::bindings::
+                                      host_rowlet_status()
+                              };
+
+                              pnp::println!("INPUT: {}", match input {
+                                  0 => "UNMAPPED",
+                                  1 => "READ ONLY - BLOCKED",
+                                  2 => "WRITABLE",
+                                  3 => "INPUT ATTEMPTED",
+                                  _ => "UNKNOWN",
+                              });
+
+                              pnp::println!("NO SOFT RESET");
+                          }'''
+          )
+
+          print("V10.5.1 main-menu status installed.")
+          print("Input: D-pad + rehid")
+          print("Mode: DRY RUN")
+          print("Automatic reset: DISABLED")
           PY
+
           python3 /tmp/v105.py
 
       - name: Fix libctru compatibility
@@ -325,6 +408,7 @@ jobs:
           if '__tdata_align' not in code:
               needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
               assert needle in code
+
               code = code.replace(
                   needle,
                   needle +
@@ -343,9 +427,11 @@ jobs:
               code = code.replace(
                   needle,
                   '\t\t. = 8 + ABSOLUTE(ALIGN('
-                  'ABSOLUTE(. - 8), MAX(4, ALIGNOF(.tdata))));\n'
+                  'ABSOLUTE(. - 8), MAX(4, '
+                  'ALIGNOF(.tdata))));\n'
                   '\t\t__tls_start = .;\n'
-                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
+                  '\t\t. += SIZEOF(.tdata) + '
+                  'SIZEOF(.tbss);',
                   1
               )
 
@@ -360,6 +446,7 @@ jobs:
           ):
               needle = 'u32 __ctru_linear_heap_size = 0;'
               assert needle in code
+
               code = code.replace(
                   needle,
                   needle +
@@ -378,13 +465,13 @@ jobs:
           docker run --rm \
             -v "$PWD:/work" \
             -w /work \
-            zaksabeast/devkitarm-rust make 2>&1 | tee v105_compile.log
+            zaksabeast/devkitarm-rust make 2>&1 | tee v1051_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-5-standalone-dry-run
+          name: rowlet-v10-5-1-main-menu-dry-run
           path: out/default.3gx
           if-no-files-found: error
 
@@ -392,6 +479,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-5-compile-log
-          path: v105_compile.log
+          name: rowlet-v10-5-1-compile-log
+          path: v1051_compile.log
           if-no-files-found: warn
