@@ -1,5 +1,5 @@
 
-name: Build Rowlet AUTO v10.2.2
+name: Build Rowlet AUTO v10.3 SAFE INPUT TEST
 
 on:
   workflow_dispatch:
@@ -14,497 +14,195 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply Rowlet patch
+      - name: Apply Rowlet Watch V5
         run: python3 patch/apply_patch.py .
 
-      - name: Add Rowlet automated controller
+      - name: Add V10.3 guarded input test
         shell: bash
         run: |
-          cat > /tmp/rowlet_auto_patch.py <<'PY'
-          #!/usr/bin/env python3
+          cat > /tmp/v103.py <<'PY'
           from pathlib import Path
+          root = Path('.')
 
-          root = Path('.').resolve()
-
-          def replace(path, old, new):
-              p = root / path
+          def edit(name, old, new):
+              p = root / name
               s = p.read_text()
-              if s.count(old) != 1:
-                  raise RuntimeError(
-                      f'{path}: expected one anchor '
-                      f'{old!r}, found {s.count(old)}'
-                  )
+              n = s.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{name}: expected one match, got {n}: {old!r}')
               p.write_text(s.replace(old, new, 1))
 
-          # HID bridge: D-pad + rehid.
-          p = root / '3gx/sources/hid.c'
-          s = p.read_text()
-
-          s += r'''
-
+          # No background threads, no physical-memory aliases and no
+          # writes unless the OS explicitly identifies the page as writable.
+          bridge = r'''
           #include <3ds.h>
-          #include "csvc.h"
-          #include "common.h"
-
-          static volatile u32 auto_rowlet_mask = 0;
-          static volatile bool auto_rowlet_thread_running = false;
-          static volatile bool auto_rowlet_started = false;
-          static vu32 *auto_rowlet_base = 0;
-
-          #define ROWLET_KEYS (KEY_A | KEY_B | KEY_SELECT | KEY_START | KEY_DRIGHT | KEY_DLEFT | KEY_DUP | KEY_DDOWN | KEY_R | KEY_L | KEY_X | KEY_Y)
-
-          void auto_rowlet_keys(u32 keys) {
-            auto_rowlet_mask = keys & ROWLET_KEYS;
-          }
-
-          bool auto_rowlet_available(void) {
-            return auto_rowlet_started &&
-                   auto_rowlet_base != 0;
-          }
-
-          static void auto_rowlet_pump(void *unused) {
-            (void)unused;
-            auto_rowlet_thread_running = true;
-
-            while (auto_rowlet_thread_running) {
-              u32 keys = auto_rowlet_mask;
-
-              if (keys && auto_rowlet_base) {
-                vu32 *mem = (vu32 *)PA_FROM_VA_PTR(
-                    (u32)auto_rowlet_base
-                );
-
-                if (mem) {
-                  u32 idx = mem[0x10 / 4] & 7u;
-
-                  vu32 *entry = (vu32 *)(
-                      (u8 *)mem + 0x28 + idx * 0x10
-                  );
-
-                  entry[0] |= keys;
-                  entry[1] |= keys;
-                  entry[2] &= ~keys;
-                  mem[0x1c / 4] |= keys & 0xfffu;
-                }
+          #include "hid.h"
+          static u32 rowlet_input_state = 0; // 0=unmapped, 1=read-only, 2=ready, 3=attempted
+          u32 rowlet_input_status(void) { return rowlet_input_state; }
+          void rowlet_inject(u32 keys) {
+              extern vu32 *g_key_addr;
+              if (!g_key_addr) { rowlet_input_state = 0; return; }
+              MemInfo mi;
+              PageInfo pi;
+              if (svcQueryMemory(&mi, &pi, (u32)g_key_addr) != 0) {
+                  rowlet_input_state = 1;
+                  return;
               }
-
-              svcSleepThread(2000000);
-            }
-          }
-
-          void auto_rowlet_start_thread(void) {
-            if (!auto_rowlet_started) {
-              Thread t = threadCreate(
-                  auto_rowlet_pump,
-                  NULL,
-                  0x1000,
-                  0x30,
-                  -2,
-                  true
-              );
-
-              if (t) {
-                auto_rowlet_started = true;
+              if (!(mi.perm & MEMPERM_WRITE)) {
+                  rowlet_input_state = 1;
+                  return;
               }
-            }
+              rowlet_input_state = 2;
+              if (keys) {
+                  *g_key_addr |= (keys & (KEY_DUP | KEY_A));
+                  rowlet_input_state = 3;
+              }
           }
           '''
+          p = root / '3gx/sources/hid.c'
+          p.write_text(p.read_text() + '\n' + bridge)
+          p = root / '3gx/includes/hid.h'
+          p.write_text(p.read_text() + '\nvoid rowlet_inject(u32 keys);\nu32 rowlet_input_status(void);\n')
 
-          s = s.replace(
-              '  g_key_addr = key_addr;',
-              '  g_key_addr = key_addr;\n'
-              '  auto_rowlet_base = '
-              '(vu32 *)((u8 *)key_addr - 0x28);'
-          )
+          edit('3gx/sources/pnp.c', 'u32 host_just_pressed()\n',
+               'void host_rowlet_inject(u32 keys) { rowlet_inject(keys); }\n'
+               'u32 host_rowlet_status() { return rowlet_input_status(); }\n'
+               'u32 host_just_pressed()\n')
+          edit('reader_core/src/pnp/mod.rs', 'mod bindings;', 'pub(crate) mod bindings;')
+          edit('reader_core/src/pnp/bindings.rs',
+               '    pub fn host_get_game_title_id() -> u64;',
+               '    pub fn host_get_game_title_id() -> u64;\n'
+               '    pub fn host_rowlet_inject(keys: u32);\n'
+               '    pub fn host_rowlet_status() -> u32;')
 
-          s = s.replace(
-              'vu32 *g_key_addr = 0;',
-              'static vu32 *auto_rowlet_base;\n'
-              'vu32 *g_key_addr = 0;'
-          )
-
-          s = s.replace(
-              'static vu32 *auto_rowlet_base = 0;',
-              ''
-          )
-
-          p.write_text(s)
-
-          replace(
-              '3gx/includes/hid.h',
-              'void scan_input();',
-              '''void scan_input();
-          void auto_rowlet_keys(u32 keys);
-          bool auto_rowlet_available(void);
-          void auto_rowlet_start_thread();'''
-          )
-
-          replace(
-              '3gx/sources/main.c',
-              '    initialize();\n',
-              '''    auto_rowlet_start_thread();
-              initialize();
-          '''
-          )
-
-          replace(
-              '3gx/sources/pnp.c',
-              'u32 host_just_pressed()\n',
-              '''void host_auto_rowlet_keys(u32 bits) {
-            auto_rowlet_keys(bits);
-          }
-          u32 host_auto_rowlet_available() {
-            return (u32)auto_rowlet_available();
-          }
-          u32 host_just_pressed()
-          '''
-          )
-
-          replace(
-              'reader_core/src/pnp/mod.rs',
-              'mod bindings;',
-              'pub(crate) mod bindings;'
-          )
-
-          replace(
-              'reader_core/src/pnp/bindings.rs',
-              '    pub fn host_get_game_title_id() -> u64;',
-              '''    pub fn host_get_game_title_id() -> u64;
-              pub fn host_auto_rowlet_keys(bits: u32);
-              pub fn host_auto_rowlet_available() -> u32;'''
-          )
-
-          # Preserve Watch counters on new cycles.
-          for path in (
-              'patch/rowlet_watch.rs',
-              'reader_core/src/gen7/rowlet_watch.rs'
-          ):
-              replace(
-                  path,
-                  "    fn fail(&mut self, reason: &'static str) {",
-                  '''    pub fn next_cycle(&mut self) {
-                  let count = self.count;
-                  *self = Self::new();
-                  self.count = count;
-              }
-              fn fail(&mut self, reason: &'static str) {'''
-              )
-
-          # Rowlet automation.
-          auto_rust = r'''
+          auto = r'''
           use super::rowlet_watch::{Phase, Watch};
           use crate::pnp::{self, Button};
 
-          const KEY_A: u32 = 1;
-
-          // D-pad Up is remapped by rehid.
-          const KEY_UP: u32 = 1 << 6;
-
-          const MAX_DIALOG_FRAMES: u32 = 120 * 60;
+          const UP: u32 = 1 << 6; // DPAD UP; rehid mapping on console
+          const A: u32 = 1;
 
           #[derive(Clone, Copy, PartialEq, Eq)]
-          pub enum Step {
-              Off,
-              Walk,
-              Dialog,
-              Check,
-              Done,
-              Shiny,
-              Halt
-          }
-
+          pub enum Step { Off, Walk, Dialog, Check, Done, Shiny, Halt }
           impl Step {
               pub fn label(self) -> &'static str {
                   match self {
-                      Self::Off =>
-                          "OFF: B+SELECT to arm",
-                      Self::Walk =>
-                          "DRY RUN: D-PAD UP",
-                      Self::Dialog =>
-                          "DRY RUN: sending A",
-                      Self::Check =>
-                          "DRY RUN: checking PID",
-                      Self::Done =>
-                          "DRY RUN DONE: non-shiny",
-                      Self::Shiny =>
-                          "SHINY! STOPPED",
-                      Self::Halt =>
-                          "DRY RUN STOP: check console",
+                      Self::Off => "OFF: B+SELECT to test",
+                      Self::Walk => "TEST: sending DPAD UP",
+                      Self::Dialog => "TEST: sending A",
+                      Self::Check => "TEST: checking Rowlet",
+                      Self::Done => "DRY RUN DONE: non-shiny",
+                      Self::Shiny => "SHINY: STOPPED",
+                      Self::Halt => "STOPPED: check console",
                   }
               }
           }
-
-          pub struct Auto {
-              pub step: Step,
-              pub frames: u32,
-              pub cycles: u32,
-              debounce: u16,
-          }
-
+          pub struct Auto { pub step: Step, frames: u32, debounce: u16 }
           impl Auto {
               pub const fn new() -> Self {
-                  Self {
-                      step: Step::Off,
-                      frames: 0,
-                      cycles: 0,
-                      debounce: 0
-                  }
+                  Self { step: Step::Off, frames: 0, debounce: 0 }
               }
-
-              fn set(&mut self, new_step: Step) {
-                  self.step = new_step;
+              fn set(&mut self, next: Step) {
+                  self.step = next;
                   self.frames = 0;
               }
-
-              pub fn tick(
-                  &mut self,
-                  watch: &mut Watch,
-                  _species: u16
-              ) {
-                  if self.debounce > 0 {
-                      self.debounce -= 1;
-                  }
-
-                  let toggle =
-                      pnp::is_pressing(Button::B) &&
+              pub fn tick(&mut self, w: &Watch) {
+                  if self.debounce > 0 { self.debounce -= 1; }
+                  let toggle = pnp::is_pressing(Button::B) &&
                       pnp::is_pressing(Button::Select);
-
                   if toggle && self.debounce == 0 {
                       self.debounce = 90;
-
-                      if self.step == Step::Off &&
-                          watch.phase == Phase::WaitRowlet &&
-                          unsafe {
-                              crate::pnp::bindings::
-                                  host_auto_rowlet_available()
-                          } != 0
-                      {
+                      if self.step == Step::Off && w.phase == Phase::WaitRowlet {
                           self.set(Step::Walk);
-                      } else {
-                          self.set(Step::Off);
-                      }
+                      } else { self.set(Step::Off); }
                   }
-
-                  // Never continue on shiny.
-                  if watch.phase == Phase::Shiny {
-                      self.set(Step::Shiny);
-                  }
-
-                  if watch.phase == Phase::Error {
-                      self.set(Step::Halt);
-                  }
-
-                  let mut keys: u32 = 0;
-
+                  if w.phase == Phase::Shiny { self.set(Step::Shiny); }
+                  if w.phase == Phase::Error { self.set(Step::Halt); }
+                  let mut keys = 0;
                   match self.step {
-                      Step::Off |
-                      Step::Shiny |
-                      Step::Halt => {}
-
                       Step::Walk => {
-                          if self.frames < 120 {
-                              keys = KEY_UP;
-                          } else {
-                              self.set(Step::Dialog);
-                          }
+                          if self.frames < 120 { keys = UP; }
+                          else { self.set(Step::Dialog); }
                       }
-
                       Step::Dialog => {
-                          // Rowlet is the first starter.
-
-                          if watch.phase == Phase::Verify ||
-                             watch.phase == Phase::Reverify
-                          {
+                          if w.phase == Phase::Verify || w.phase == Phase::Reverify {
                               self.set(Step::Check);
-                          } else if watch.phase == Phase::Normal {
+                          } else if w.phase == Phase::Normal {
                               self.set(Step::Done);
-                          } else if self.frames >= MAX_DIALOG_FRAMES {
+                          } else if self.frames > 7200 {
                               self.set(Step::Halt);
-                          } else if self.frames % 40 < 10 {
-                              keys = KEY_A;
-                          }
+                          } else if self.frames % 40 < 10 { keys = A; }
                       }
-
                       Step::Check => {
-                          if watch.phase == Phase::Normal {
-                              self.set(Step::Done);
-                          } else if watch.phase == Phase::WaitRowlet {
-                              self.set(Step::Halt);
-                          } else if self.frames > 180 {
-                              self.set(Step::Halt);
-                          }
+                          if w.phase == Phase::Normal { self.set(Step::Done); }
+                          else if self.frames > 240 { self.set(Step::Halt); }
                       }
-
-                      Step::Done => {
-                          // DRY RUN.
-                          // No automatic soft resets.
-                          // Stop scripted inputs.
-                      }
+                      _ => {}
                   }
-
-                  self.frames =
-                      self.frames.saturating_add(1);
-
-                  unsafe {
-                      crate::pnp::bindings::
-                          host_auto_rowlet_keys(keys);
-                  }
+                  self.frames = self.frames.saturating_add(1);
+                  unsafe { crate::pnp::bindings::host_rowlet_inject(keys); }
               }
           }
           '''
-
-          (
-              root / 'reader_core/src/gen7/rowlet_auto.rs'
-          ).write_text(auto_rust)
-
-          # Adjust Watch text.
-          for path in (
-              'patch/rowlet_watch.rs',
-              'reader_core/src/gen7/rowlet_watch.rs'
-          ):
-              replace(
-                  path,
-                  'RESET APPROVED (DRY RUN)',
-                  'DRY RUN: NORMAL'
-              )
-
-              replace(
-                  path,
-                  'Would reset; no buttons sent',
-                  'NO RESET: dry run'
-              )
-
-              replace(
-                  path,
-                  'No reset buttons will be pressed',
-                  'B+SELECT: start dry-run'
-              )
-
-          replace(
-              'reader_core/src/gen7/mod.rs',
-              'mod reader;',
-              'mod reader;\nmod rowlet_auto;'
-          )
-
-          replace(
-              'reader_core/src/gen7/frame.rs',
-              'use super::rowlet_watch::{Sample, Watch};',
-              '''use super::rowlet_watch::{Sample, Watch};
-          use super::rowlet_auto::Auto;'''
-          )
-
-          replace(
-              'reader_core/src/gen7/frame.rs',
-              ' rowlet_watch: Watch,',
-              ''' rowlet_watch: Watch,
-           rowlet_auto: Auto,'''
-          )
-
-          replace(
-              'reader_core/src/gen7/frame.rs',
-              ' rowlet_watch: Watch::new(),',
-              ''' rowlet_watch: Watch::new(),
-           rowlet_auto: Auto::new(),'''
-          )
-
-          replace(
-              'reader_core/src/gen7/frame.rs',
-              ' state.sfmt.reinit_if_needed(reader.init_seed());',
-              ''' if is_ultra_sun {
-                  let mon = reader.party_pkm(0);
-                  state.rowlet_auto.tick(
-                      &mut state.rowlet_watch,
-                      mon.species()
-                  );
-              }
-              state.sfmt.reinit_if_needed(reader.init_seed());'''
-          )
-
-          # Matches Rowlet Watch V5.
-          replace(
-              'reader_core/src/gen7/frame.rs',
-              ' pnp::println!("Reset buttons: OFF");',
-              ''' pnp::println!("MODE: DRY RUN / DPAD+REHID");
-           pnp::println!(
-               "AUTO: {}",
-               state.rowlet_auto.step.label()
-           );
-           pnp::println!("Reset commands: DISABLED");'''
-          )
-
-          replace(
-              'reader_core/src/gen7/frame.rs',
-              'pnp::println!("ROWLET WATCH v5");',
-              'pnp::println!("ROWLET AUTO v10.2.2");'
-          )
-
-          print("Rowlet AUTO v10.2.2 patched")
-          print("Input: D-pad + rehid")
-          print("Mode: DRY RUN")
-          print("Automatic reset: DISABLED")
+          (root / 'reader_core/src/gen7/rowlet_auto.rs').write_text(auto)
+          edit('reader_core/src/gen7/mod.rs', 'mod reader;',
+               'mod reader;\nmod rowlet_auto;')
+          edit('reader_core/src/gen7/frame.rs',
+               'use super::rowlet_watch::{Sample, Watch};',
+               'use super::rowlet_watch::{Sample, Watch};\nuse super::rowlet_auto::Auto;')
+          edit('reader_core/src/gen7/frame.rs',
+               '    rowlet_watch: Watch,',
+               '    rowlet_watch: Watch,\n    rowlet_auto: Auto,')
+          edit('reader_core/src/gen7/frame.rs',
+               '        rowlet_watch: Watch::new(),',
+               '        rowlet_watch: Watch::new(),\n        rowlet_auto: Auto::new(),')
+          edit('reader_core/src/gen7/frame.rs',
+               '    state.sfmt.reinit_if_needed(reader.init_seed());',
+               '    if is_ultra_sun {\n'
+               '        state.rowlet_auto.tick(&state.rowlet_watch);\n'
+               '    }\n'
+               '    state.sfmt.reinit_if_needed(reader.init_seed());')
+          edit('reader_core/src/gen7/frame.rs',
+               'pnp::println!("ROWLET WATCH v5");',
+               'pnp::println!("ROWLET AUTO v10.3");')
+          edit('reader_core/src/gen7/frame.rs',
+               '            pnp::println!("Reset buttons: OFF");',
+               '            pnp::println!("MODE: DRY RUN / NO RESET");\n'
+               '            pnp::println!("AUTO: {}", state.rowlet_auto.step.label());\n'
+               '            let input = unsafe { crate::pnp::bindings::host_rowlet_status() };\n'
+               '            pnp::println!("INPUT: {}", match input {\n'
+               '                0 => "UNMAPPED", 1 => "READ ONLY - BLOCKED",\n'
+               '                2 => "WRITABLE", 3 => "INPUT ATTEMPTED",\n'
+               '                _ => "UNKNOWN",\n'
+               '            });')
+          print('V10.3: guarded test installed; reset disabled')
           PY
-
-          python3 /tmp/rowlet_auto_patch.py
+          python3 /tmp/v103.py
 
       - name: Fix libctru 2.4.1 compatibility
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
           ld = Path('3gx/3gx.ld')
           code = ld.read_text()
-
           if '__tdata_align' not in code:
               needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
-              assert needle in code, 'Cannot locate rodata section'
-
-              code = code.replace(
-                  needle,
-                  needle +
-                  '\n\t\t__tdata_align = .;' +
-                  '\n\t\tLONG (ALIGNOF(.tdata));' +
-                  '\n\t\t. = ALIGN(4);',
-                  1
-              )
-
-          needle = (
-              '\t\t__tls_start = .;\n'
-              '\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
-          )
-
+              assert needle in code
+              code = code.replace(needle,
+                  needle + '\n\t\t__tdata_align = .;\n\t\tLONG (ALIGNOF(.tdata));\n\t\t. = ALIGN(4);',1)
+          needle = '\t\t__tls_start = .;\n\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
           if needle in code:
-              code = code.replace(
-                  needle,
-                  '\t\t. = 8 + ABSOLUTE(ALIGN('
-                  'ABSOLUTE(. - 8), MAX(4, '
-                  'ALIGNOF(.tdata))));\n'
-                  '\t\t__tls_start = .;\n'
-                  '\t\t. += SIZEOF(.tdata) + '
-                  'SIZEOF(.tbss);',
-                  1
-              )
-
+              code = code.replace(needle,
+                  '\t\t. = 8 + ABSOLUTE(ALIGN(ABSOLUTE(. - 8), MAX(4, ALIGNOF(.tdata))));\n'
+                  '\t\t__tls_start = .;\n\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',1)
           ld.write_text(code)
-
           src = Path('3gx/sources/main.c')
           code = src.read_text()
-
-          if (
-              '__system_runflags' not in code or
-              '__apt_appid' not in code
-          ):
+          if '__system_runflags' not in code or '__apt_appid' not in code:
               needle = 'u32 __ctru_linear_heap_size = 0;'
-              assert needle in code, 'Cannot locate heap definitions'
-
-              code = code.replace(
-                  needle,
-                  needle +
-                  '\n\n/* libctru compatibility */\n'
-                  'u32 __system_runflags = 0;\n'
-                  'u32 __apt_appid = 0;',
-                  1
-              )
-
+              assert needle in code
+              code = code.replace(needle,
+                  needle + '\n\nu32 __system_runflags = 0;\nu32 __apt_appid = 0;',1)
           src.write_text(code)
           PY
 
@@ -512,16 +210,14 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            zaksabeast/devkitarm-rust make 2>&1 | tee v90_compile.log
+          docker run --rm -v "$PWD:/work" -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee v103_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-auto-v10-2-2-dry-run
+          name: rowlet-v10-3-safe-dry-run
           path: out/default.3gx
           if-no-files-found: error
 
@@ -529,6 +225,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-auto-compile-log
-          path: v90_compile.log
+          name: rowlet-v10-3-compile-log
+          path: v103_compile.log
           if-no-files-found: warn
