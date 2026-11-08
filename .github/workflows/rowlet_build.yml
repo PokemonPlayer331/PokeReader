@@ -1,5 +1,5 @@
 
-name: Build Rowlet Watch V8.4 Circle Pad Fix
+name: Build Rowlet Watch V8.5 Raw Circle Pad Test
 
 on: [push, workflow_dispatch]
 
@@ -9,58 +9,61 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out repository
+      - name: Check out project
         uses: actions/checkout@v4
 
       - name: Apply V5 detector
         run: python3 patch/apply_patch.py .
 
-      - name: Apply V6 A-button control
+      - name: Apply V6 virtual A
         run: python3 patch/apply_input_test.py .
 
       - name: Apply V7.1 reset control
         run: python3 patch/apply_reset_test.py .
 
-      - name: Apply V8.3 resumable hunter
+      - name: Apply V8.3 resumable controller
         run: python3 patch/apply_v8_3.py .
 
-      - name: Fix Circle Pad Up movement for V8.4
+      - name: Fix raw Circle Pad state in V8.5
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          hid = Path('3gx/sources/hid.c')
-          main = Path('3gx/sources/main.c')
-          h = hid.read_text()
-          m = main.read_text()
+          path = Path('3gx/sources/hid.c')
+          text = path.read_text()
 
           old = 's[3] = (u32)(125u << 16);'
-          new = '''s[3] = ((u32)145u << 16);
-                  // Circle Pad Up direction flag
-                  s[0] |= (1u << 30);
-                  s[1] |= (1u << 30);'''
+          new = '''// Update current and sampled Circle Pad
+                  u32 raw_pa = svcConvertVAToPA(
+                      (const void *)(base + (0x20 / 4)), false);
+                  if (!raw_pa) return false;
+                  volatile u32 *raw =
+                      (volatile u32 *)(raw_pa | 0x80000000u);
+                  const u32 circle_up = (u32)(145u << 16);
+                  *raw = circle_up;
+                  s[3] = circle_up;
+                  s[0] |= KEY_CPAD_UP;
+                  s[1] |= KEY_CPAD_UP;'''
 
-          if h.count(old) != 1:
-              raise SystemExit('Circle Pad anchor missing')
+          if text.count(old) != 1:
+              raise SystemExit('Circle Pad code not found')
+          path.write_text(text.replace(old, new, 1))
 
-          old_pulse = 'if (v8_frames < 28 && !rowlet_v8_inject(0, true))'
-          new_pulse = 'if (v8_frames < 32 && !rowlet_v8_inject(0, true))'
-          old_end = 'if (v8_frames >= 28) v8_go(4);'
-          new_end = 'if (v8_frames >= 32) v8_go(4);'
-
-          if m.count(old_pulse) != 1 or m.count(old_end) != 1:
-              raise SystemExit('Movement anchors missing')
-
-          hid.write_text(h.replace(old, new, 1))
-          main.write_text(
-              m.replace(old_pulse, new_pulse, 1)
-               .replace(old_end, new_end, 1)
+          main = Path('3gx/sources/main.c')
+          m = main.read_text()
+          anchor = 'if (v8_state == 4 || v8_state == 7) expected_virtual = KEY_A;'
+          replacement = (
+              anchor + '\n    if (v8_state == 3) '
+              'expected_virtual = KEY_CPAD_UP;'
           )
 
-          print('V8.4 movement fix applied')
+          if m.count(anchor) != 1:
+              raise SystemExit('Input guard not found')
+          main.write_text(m.replace(anchor, replacement, 1))
+
+          print('V8.5 movement fix applied')
           PY
 
       - name: Compile plugin
@@ -73,6 +76,6 @@ jobs:
       - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-watch-v8-4-plugin
+          name: rowlet-watch-v8-5-plugin
           path: out/default.3gx
           if-no-files-found: error
