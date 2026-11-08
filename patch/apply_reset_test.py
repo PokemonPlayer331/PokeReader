@@ -1,6 +1,6 @@
 
 #!/usr/bin/env python3
-"""V7 manual soft-reset test, applied after V6."""
+"""V7.1: manual reset test after releasing physical buttons."""
 from pathlib import Path
 import sys
 
@@ -14,28 +14,27 @@ for path in (main, hid, hdr):
         raise SystemExit(f'Missing file: {path}')
 
 m, h, d = main.read_text(), hid.read_text(), hdr.read_text()
-marker = 'ROWLET_V7_RESET_TEST'
 
-if any(marker in s for s in (m, h, d)):
+if any('ROWLET_V7_RESET_TEST' in s for s in (m, h, d)):
     raise SystemExit('V7 already applied')
 
 checks = [
-    ('V6 injector', 'bool rowlet_try_inject_a_frame(void)', h),
-    ('V6 header', 'bool rowlet_try_inject_a_frame(void);', d),
-    ('V6 hook', '        rowlet_a_test_tick();', m),
+    ('A injector', 'bool rowlet_try_inject_a_frame(void)', h),
+    ('HID header', 'bool rowlet_try_inject_a_frame(void);', d),
+    ('A hook', '        rowlet_a_test_tick();', m),
     ('render', '        draw_to_screen(screenId, fb_a, stride, format);', m),
-    ('run_hook', 'void run_hook(', m),
+    ('hook', 'void run_hook(', m),
 ]
-
 for label, anchor, content in checks:
     if content.count(anchor) != 1:
-        raise SystemExit(f'{label} missing or duplicated')
+        raise SystemExit(f'Could not find {label} exactly once')
 
 h += r'''
 // ROWLET_V7_RESET_TEST
 bool rowlet_try_inject_reset_frame(void)
 {
     if (!g_key_addr) return false;
+
     volatile u32 *base = g_key_addr - (0x28 / 4);
     u32 index = base[0x10 / 4];
     if (index >= 8) return false;
@@ -57,9 +56,11 @@ bool rowlet_try_inject_reset_frame(void)
         (volatile u32 *)(current_pa | 0x80000000u);
 
     const u32 combo = KEY_L | KEY_R | KEY_START;
+
     s[0] |= combo;
     s[1] |= combo;
     *cur |= combo;
+
     return true;
 }
 '''
@@ -71,12 +72,13 @@ bool rowlet_try_inject_reset_frame(void);
 
 controller = r'''
 // ROWLET_V7_RESET_TEST
-// Manual trigger only: hold L+X+B.
-static unsigned int rowlet_reset_status = 0;
-static unsigned int rowlet_reset_idle = 0;
-static unsigned int rowlet_reset_hold = 0;
-static unsigned int rowlet_reset_pulse = 0;
-static bool rowlet_reset_armed = false;
+// States: ready, wait release, send, attempted, failed.
+static unsigned int reset_status = 0;
+static unsigned int reset_idle = 0;
+static unsigned int reset_hold = 0;
+static unsigned int reset_pulse = 0;
+static unsigned int reset_wait = 0;
+static bool reset_armed = false;
 
 static void rowlet_reset_test_tick(void)
 {
@@ -86,81 +88,103 @@ static void rowlet_reset_test_tick(void)
     const u32 keys = get_current_keys();
     const u32 trigger = KEY_L | KEY_X | KEY_B;
 
-    if (!rowlet_reset_armed)
+    if (reset_status == 0 && !reset_armed)
     {
-        rowlet_reset_idle =
-            (keys == 0) ? rowlet_reset_idle + 1 : 0;
-
-        if (rowlet_reset_idle >= 30)
-            rowlet_reset_armed = true;
+        reset_idle = (keys == 0) ? reset_idle + 1 : 0;
+        if (reset_idle >= 30)
+            reset_armed = true;
     }
 
-    if (rowlet_reset_status == 0 && rowlet_reset_armed)
+    if (reset_status == 0 && reset_armed)
     {
-        rowlet_reset_hold =
-            (keys == trigger) ? rowlet_reset_hold + 1 : 0;
+        reset_hold = (keys == trigger) ? reset_hold + 1 : 0;
 
-        if (rowlet_reset_hold >= 60)
+        if (reset_hold >= 60)
         {
-            rowlet_reset_armed = false;
-            rowlet_reset_status = 1;
-            rowlet_reset_pulse = 0;
+            reset_armed = false;
+            reset_status = 1;
+            reset_idle = 0;
+            reset_wait = 0;
         }
     }
-
-    if (rowlet_reset_status == 1)
+    else if (reset_status == 1)
     {
+        // Wait for ALL physical buttons to be released.
         if (keys & KEY_SELECT)
         {
-            rowlet_reset_status = 3;
+            reset_status = 4;
             return;
         }
 
+        reset_idle = (keys == 0) ? reset_idle + 1 : 0;
+
+        if (reset_idle >= 15)
+        {
+            reset_status = 2;
+            reset_pulse = 0;
+        }
+        else if (++reset_wait >= 600)
+        {
+            reset_status = 4;
+        }
+    }
+    else if (reset_status == 2)
+    {
         if (!rowlet_try_inject_reset_frame())
         {
-            rowlet_reset_status = 3;
+            reset_status = 4;
             return;
         }
 
-        if (++rowlet_reset_pulse >= 20)
-            rowlet_reset_status = 2;
+        if (++reset_pulse >= 45)
+            reset_status = 3;
     }
 }
 '''
 
 m = m.replace(
     'void run_hook(',
-    controller + 'void run_hook(', 1)
+    controller + 'void run_hook(',
+    1
+)
 
 m = m.replace(
     '        rowlet_a_test_tick();',
     '        rowlet_a_test_tick();\n'
-    '        rowlet_reset_test_tick();', 1)
+    '        rowlet_reset_test_tick();',
+    1
+)
 
 m = m.replace(
     '        draw_to_screen(screenId, fb_a, stride, format);',
     '''        if (get_title_id() == 0x00040000001B5000ULL)
         {
-            const char *reset_label = 0;
-            if (rowlet_reset_status == 1)
-                reset_label = "RESET TEST: SENDING";
-            if (rowlet_reset_status == 2)
-                reset_label = "RESET TEST: ATTEMPTED";
-            if (rowlet_reset_status == 3)
-                reset_label = "RESET TEST: FAILED";
+            const char *label = 0;
 
-            if (reset_label)
+            if (reset_status == 1)
+                label = "RESET TEST: RELEASE BUTTONS";
+            if (reset_status == 2)
+                label = "RESET TEST: SENDING";
+            if (reset_status == 3)
+                label = "RESET TEST: ATTEMPTED";
+            if (reset_status == 4)
+                label = "RESET TEST: FAILED";
+
+            if (label)
                 host_print(
-                    (u32)reset_label,
-                    strlen(reset_label),
+                    (u32)label,
+                    strlen(label),
                     0x00ff00);
         }
-        draw_to_screen(screenId, fb_a, stride, format);''', 1)
+
+        draw_to_screen(screenId, fb_a, stride, format);''',
+    1
+)
 
 hid.write_text(h)
 hdr.write_text(d)
 main.write_text(m)
 
-print("V7 manual reset test patched.")
-print("Trigger: hold L+X+B for about one second.")
-print("No automatic hunting or resetting enabled.")
+print("V7.1 patch applied.")
+print("Hold L+X+B for one second, then release.")
+print("No automatic resets enabled.")
