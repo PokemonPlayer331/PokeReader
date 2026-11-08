@@ -1,5 +1,5 @@
 
-name: Build Rowlet AUTO v10.3 SAFE INPUT TEST
+name: Build Rowlet V10.4 InputRedirection Dry Run
 
 on:
   workflow_dispatch:
@@ -14,210 +14,116 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply Rowlet Watch V5
+      - name: Apply stable Rowlet Watch patch
         run: python3 patch/apply_patch.py .
 
-      - name: Add V10.3 guarded input test
+      - name: Label V10.4 dry run on Rowlet Watch screen
         shell: bash
         run: |
-          cat > /tmp/v103.py <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
-          root = Path('.')
 
-          def edit(name, old, new):
-              p = root / name
-              s = p.read_text()
-              n = s.count(old)
-              if n != 1:
-                  raise RuntimeError(f'{name}: expected one match, got {n}: {old!r}')
-              p.write_text(s.replace(old, new, 1))
+          p = Path('reader_core/src/gen7/frame.rs')
+          s = p.read_text()
 
-          # No background threads, no physical-memory aliases and no
-          # writes unless the OS explicitly identifies the page as writable.
-          bridge = r'''
-          #include <3ds.h>
-          #include "hid.h"
-          static u32 rowlet_input_state = 0; // 0=unmapped, 1=read-only, 2=ready, 3=attempted
-          u32 rowlet_input_status(void) { return rowlet_input_state; }
-          void rowlet_inject(u32 keys) {
-              extern vu32 *g_key_addr;
-              if (!g_key_addr) { rowlet_input_state = 0; return; }
-              MemInfo mi;
-              PageInfo pi;
-              if (svcQueryMemory(&mi, &pi, (u32)g_key_addr) != 0) {
-                  rowlet_input_state = 1;
-                  return;
-              }
-              if (!(mi.perm & MEMPERM_WRITE)) {
-                  rowlet_input_state = 1;
-                  return;
-              }
-              rowlet_input_state = 2;
-              if (keys) {
-                  *g_key_addr |= (keys & (KEY_DUP | KEY_A));
-                  rowlet_input_state = 3;
-              }
-          }
-          '''
-          p = root / '3gx/sources/hid.c'
-          p.write_text(p.read_text() + '\n' + bridge)
-          p = root / '3gx/includes/hid.h'
-          p.write_text(p.read_text() + '\nvoid rowlet_inject(u32 keys);\nu32 rowlet_input_status(void);\n')
+          a = 'pnp::println!("ROWLET WATCH v5");'
+          b = 'pnp::println!("Reset buttons: OFF");'
 
-          edit('3gx/sources/pnp.c', 'u32 host_just_pressed()\n',
-               'void host_rowlet_inject(u32 keys) { rowlet_inject(keys); }\n'
-               'u32 host_rowlet_status() { return rowlet_input_status(); }\n'
-               'u32 host_just_pressed()\n')
-          edit('reader_core/src/pnp/mod.rs', 'mod bindings;', 'pub(crate) mod bindings;')
-          edit('reader_core/src/pnp/bindings.rs',
-               '    pub fn host_get_game_title_id() -> u64;',
-               '    pub fn host_get_game_title_id() -> u64;\n'
-               '    pub fn host_rowlet_inject(keys: u32);\n'
-               '    pub fn host_rowlet_status() -> u32;')
+          assert s.count(a) == 1, 'Rowlet Watch V5 heading not found'
+          assert s.count(b) == 1, 'Rowlet Watch reset status not found'
 
-          auto = r'''
-          use super::rowlet_watch::{Phase, Watch};
-          use crate::pnp::{self, Button};
+          s = s.replace(
+              a,
+              'pnp::println!("ROWLET V10.4 REMOTE");',
+              1
+          )
 
-          const UP: u32 = 1 << 6; // DPAD UP; rehid mapping on console
-          const A: u32 = 1;
+          s = s.replace(
+              b,
+              'pnp::println!("MODE: DRY RUN");\n'
+              '            pnp::println!("Input: PC over WiFi");\n'
+              '            pnp::println!("Reset: DISABLED");',
+              1
+          )
 
-          #[derive(Clone, Copy, PartialEq, Eq)]
-          pub enum Step { Off, Walk, Dialog, Check, Done, Shiny, Halt }
-          impl Step {
-              pub fn label(self) -> &'static str {
-                  match self {
-                      Self::Off => "OFF: B+SELECT to test",
-                      Self::Walk => "TEST: sending DPAD UP",
-                      Self::Dialog => "TEST: sending A",
-                      Self::Check => "TEST: checking Rowlet",
-                      Self::Done => "DRY RUN DONE: non-shiny",
-                      Self::Shiny => "SHINY: STOPPED",
-                      Self::Halt => "STOPPED: check console",
-                  }
-              }
-          }
-          pub struct Auto { pub step: Step, frames: u32, debounce: u16 }
-          impl Auto {
-              pub const fn new() -> Self {
-                  Self { step: Step::Off, frames: 0, debounce: 0 }
-              }
-              fn set(&mut self, next: Step) {
-                  self.step = next;
-                  self.frames = 0;
-              }
-              pub fn tick(&mut self, w: &Watch) {
-                  if self.debounce > 0 { self.debounce -= 1; }
-                  let toggle = pnp::is_pressing(Button::B) &&
-                      pnp::is_pressing(Button::Select);
-                  if toggle && self.debounce == 0 {
-                      self.debounce = 90;
-                      if self.step == Step::Off && w.phase == Phase::WaitRowlet {
-                          self.set(Step::Walk);
-                      } else { self.set(Step::Off); }
-                  }
-                  if w.phase == Phase::Shiny { self.set(Step::Shiny); }
-                  if w.phase == Phase::Error { self.set(Step::Halt); }
-                  let mut keys = 0;
-                  match self.step {
-                      Step::Walk => {
-                          if self.frames < 120 { keys = UP; }
-                          else { self.set(Step::Dialog); }
-                      }
-                      Step::Dialog => {
-                          if w.phase == Phase::Verify || w.phase == Phase::Reverify {
-                              self.set(Step::Check);
-                          } else if w.phase == Phase::Normal {
-                              self.set(Step::Done);
-                          } else if self.frames > 7200 {
-                              self.set(Step::Halt);
-                          } else if self.frames % 40 < 10 { keys = A; }
-                      }
-                      Step::Check => {
-                          if w.phase == Phase::Normal { self.set(Step::Done); }
-                          else if self.frames > 240 { self.set(Step::Halt); }
-                      }
-                      _ => {}
-                  }
-                  self.frames = self.frames.saturating_add(1);
-                  unsafe { crate::pnp::bindings::host_rowlet_inject(keys); }
-              }
-          }
-          '''
-          (root / 'reader_core/src/gen7/rowlet_auto.rs').write_text(auto)
-          edit('reader_core/src/gen7/mod.rs', 'mod reader;',
-               'mod reader;\nmod rowlet_auto;')
-          edit('reader_core/src/gen7/frame.rs',
-               'use super::rowlet_watch::{Sample, Watch};',
-               'use super::rowlet_watch::{Sample, Watch};\nuse super::rowlet_auto::Auto;')
-          edit('reader_core/src/gen7/frame.rs',
-               '    rowlet_watch: Watch,',
-               '    rowlet_watch: Watch,\n    rowlet_auto: Auto,')
-          edit('reader_core/src/gen7/frame.rs',
-               '        rowlet_watch: Watch::new(),',
-               '        rowlet_watch: Watch::new(),\n        rowlet_auto: Auto::new(),')
-          edit('reader_core/src/gen7/frame.rs',
-               '    state.sfmt.reinit_if_needed(reader.init_seed());',
-               '    if is_ultra_sun {\n'
-               '        state.rowlet_auto.tick(&state.rowlet_watch);\n'
-               '    }\n'
-               '    state.sfmt.reinit_if_needed(reader.init_seed());')
-          edit('reader_core/src/gen7/frame.rs',
-               'pnp::println!("ROWLET WATCH v5");',
-               'pnp::println!("ROWLET AUTO v10.3");')
-          edit('reader_core/src/gen7/frame.rs',
-               '            pnp::println!("Reset buttons: OFF");',
-               '            pnp::println!("MODE: DRY RUN / NO RESET");\n'
-               '            pnp::println!("AUTO: {}", state.rowlet_auto.step.label());\n'
-               '            let input = unsafe { crate::pnp::bindings::host_rowlet_status() };\n'
-               '            pnp::println!("INPUT: {}", match input {\n'
-               '                0 => "UNMAPPED", 1 => "READ ONLY - BLOCKED",\n'
-               '                2 => "WRITABLE", 3 => "INPUT ATTEMPTED",\n'
-               '                _ => "UNKNOWN",\n'
-               '            });')
-          print('V10.3: guarded test installed; reset disabled')
+          p.write_text(s)
+          print('V10.4 overlay labeled; no memory injection')
           PY
-          python3 /tmp/v103.py
 
       - name: Fix libctru 2.4.1 compatibility
         run: |
           python3 - <<'PY'
           from pathlib import Path
+
           ld = Path('3gx/3gx.ld')
           code = ld.read_text()
+
           if '__tdata_align' not in code:
               needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
               assert needle in code
-              code = code.replace(needle,
-                  needle + '\n\t\t__tdata_align = .;\n\t\tLONG (ALIGNOF(.tdata));\n\t\t. = ALIGN(4);',1)
-          needle = '\t\t__tls_start = .;\n\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
+
+              code = code.replace(
+                  needle,
+                  needle +
+                  '\n\t\t__tdata_align = .;'
+                  '\n\t\tLONG (ALIGNOF(.tdata));'
+                  '\n\t\t. = ALIGN(4);',
+                  1
+              )
+
+          needle = (
+              '\t\t__tls_start = .;\n'
+              '\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
+          )
+
           if needle in code:
-              code = code.replace(needle,
-                  '\t\t. = 8 + ABSOLUTE(ALIGN(ABSOLUTE(. - 8), MAX(4, ALIGNOF(.tdata))));\n'
-                  '\t\t__tls_start = .;\n\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',1)
+              code = code.replace(
+                  needle,
+                  '\t\t. = 8 + ABSOLUTE(ALIGN('
+                  'ABSOLUTE(. - 8), MAX(4, '
+                  'ALIGNOF(.tdata))));\n'
+                  '\t\t__tls_start = .;\n'
+                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
+                  1
+              )
+
           ld.write_text(code)
+
           src = Path('3gx/sources/main.c')
           code = src.read_text()
-          if '__system_runflags' not in code or '__apt_appid' not in code:
+
+          if (
+              '__system_runflags' not in code or
+              '__apt_appid' not in code
+          ):
               needle = 'u32 __ctru_linear_heap_size = 0;'
               assert needle in code
-              code = code.replace(needle,
-                  needle + '\n\nu32 __system_runflags = 0;\nu32 __apt_appid = 0;',1)
+
+              code = code.replace(
+                  needle,
+                  needle +
+                  '\n\nu32 __system_runflags = 0;'
+                  '\nu32 __apt_appid = 0;',
+                  1
+              )
+
           src.write_text(code)
           PY
 
-      - name: Compile and save log
+      - name: Build plugin and save log
         shell: bash
         run: |
           set -o pipefail
-          docker run --rm -v "$PWD:/work" -w /work \
-            zaksabeast/devkitarm-rust make 2>&1 | tee v103_compile.log
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee v104_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-3-safe-dry-run
+          name: rowlet-v10-4-dry-run-plugin
           path: out/default.3gx
           if-no-files-found: error
 
@@ -225,6 +131,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-3-compile-log
-          path: v103_compile.log
+          name: rowlet-v10-4-compile-log
+          path: v104_compile.log
           if-no-files-found: warn
