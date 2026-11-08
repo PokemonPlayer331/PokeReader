@@ -1,7 +1,7 @@
+name: Build Rowlet Watch V8.3 - Resume Test
 
-name: Build Rowlet Watch V8.6 Movement Probe
-
-on: [push, workflow_dispatch]
+on:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,139 +12,420 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Apply V5 detector
         run: python3 patch/apply_patch.py .
-
-      - name: Apply V6 A input
+      - name: Apply V6 virtual A
         run: python3 patch/apply_input_test.py .
-
-      - name: Apply V7 reset test
+      - name: Apply V7.1 soft reset
         run: python3 patch/apply_reset_test.py .
-
-      - name: Apply V8.3 controller
-        run: python3 patch/apply_v8_3.py .
-
-      - name: Fix raw Circle Pad state in V8.5
+      - name: Apply V8 integrated navigation
         shell: bash
         run: |
-          python3 - <<'PY'
+          cat > /tmp/rowlet_v8_patch.py <<'ROWLET_V8_SCRIPT'
+          #!/usr/bin/env python3
+          """V8: Limited integrated Rowlet Auto Test. Run AFTER V5, V6 and V7.1 patches.
+
+          Patches the known PokeReader tree; on unknown layouts aborts without writing files.
+          This is a first hardware test, not a verified unattended hunter.
+          """
           from pathlib import Path
+          import argparse
+          p = argparse.ArgumentParser()
+          p.add_argument('root', nargs='?', default='.')
+          root = Path(p.parse_args().root).resolve()
+          main = root / '3gx/sources/main.c'
+          hid = root / '3gx/sources/hid.c'
+          header = root / '3gx/includes/hid.h'
+          frame = root / 'reader_core/src/gen7/frame.rs'
+          watch = root / 'reader_core/src/gen7/rowlet_watch.rs'
+          paths = (main, hid, header, frame, watch)
+          for path in paths:
+              if not path.is_file():
+                  raise SystemExit(f'Expected source file missing: {path}')
+          m,h,d,f,w = [x.read_text() for x in paths]
+          MARKER = 'ROWLET_V8_INTEGRATED'
+          if any(MARKER in x for x in (m,h,d,f,w)):
+              raise SystemExit('V8 is already patched. Build from a clean checkout.')
 
-          path = Path('3gx/sources/hid.c')
-          text = path.read_text()
+          def repl(s, old, new, label):
+              n=s.count(old)
+              if n != 1: raise SystemExit(f'{label} expected once, saw {n}; NO files changed')
+              return s.replace(old,new,1)
 
-          old = 's[3] = (u32)(125u << 16);'
-          new = '''u32 raw_pa = svcConvertVAToPA(
-                      (const void *)(base + (0x20 / 4)), false);
-                  if (!raw_pa) return false;
-                  volatile u32 *raw =
-                      (volatile u32 *)(raw_pa | 0x80000000u);
-                  const u32 circle_up = (u32)(145u << 16);
-                  *raw = circle_up;
-                  s[3] = circle_up;
-                  s[0] |= KEY_CPAD_UP;
-                  s[1] |= KEY_CPAD_UP;'''
+          for label,source,anchor in [
+              ('V5 Rust import',f,'use super::rowlet_watch::{Sample, Watch};'),
+              ('V5 Rust tick',f,'            shiny: mon.is_shiny(),\n        });'),
+              ('V5 Rust phase',w,'if matches!(self.phase, Phase::Normal | Phase::Shiny | Phase::Error) {'),
+              ('V6 HID',h,'bool rowlet_try_inject_a_frame(void)'),
+              ('V7 HID',h,'bool rowlet_try_inject_reset_frame(void)'),
+              ('V7 hook',m,'        rowlet_reset_test_tick();'),
+              ('V7 render',m,'        draw_to_screen(screenId, fb_a, stride, format);'),
+              ('main hook',m,'void run_hook('),
+          ]:
+              if anchor not in source: raise SystemExit(f'Missing {label}; NO files changed')
 
-          if text.count(old) != 1:
-              raise SystemExit('Movement anchor missing')
-          path.write_text(text.replace(old, new, 1))
+          # The v5 Watch must recognize a *new* empty-slot encounter after the soft reset.
+          # Terminal shiny / error states NEVER re-arm automatically.
+          w = repl(w,
+          '''        // Stop states latch. The player must manually soft reset for a new run.
+                  if matches!(self.phase, Phase::Normal | Phase::Shiny | Phase::Error) {
+                      return;
+                  }''',
+          '''        // ROWLET_V8_INTEGRATED: re-arm only after a *new* empty party slot.
+                  // Shiny and error remain latched forever until process restart.
+                  if self.phase == Phase::Normal {
+                      if s.tsv == TSV && s.species == 0 {
+                          self.frames = self.frames.saturating_add(1);
+                          if self.frames >= EMPTY_FRAMES {
+                              let n = self.count;
+                              *self = Self::new();
+                              self.count = n;
+                              self.phase = Phase::WaitRowlet;
+                              self.tsv = TSV;
+                              self.message = "New empty party confirmed";
+                          }
+                      } else {
+                          self.frames = 0;
+                      }
+                      return;
+                  }
+                  if matches!(self.phase, Phase::Shiny | Phase::Error) {
+                      return;
+                  }''','Rust reset rearm')
 
-          main = Path('3gx/sources/main.c')
-          m = main.read_text()
-          anchor = 'if (v8_state == 4 || v8_state == 7) expected_virtual = KEY_A;'
-          replacement = (anchor + '\n    if (v8_state == 3) '
-                         'expected_virtual = KEY_CPAD_UP;')
-          if m.count(anchor) != 1:
-              raise SystemExit('Input guard missing')
-          main.write_text(m.replace(anchor, replacement, 1))
-          PY
+          f = repl(f,'use super::rowlet_watch::{Sample, Watch};',
+                   'use super::rowlet_watch::{Sample, Watch, Phase};','Rust phase import')
+          f = repl(f,'''            shiny: mon.is_shiny(),
+                  });''',
+          '''            shiny: mon.is_shiny(),
+                  });
+                  // ROWLET_V8_INTEGRATED: report decoded and verified read-only status.
+                  // C never calculates shiny status on unvalidated encrypted bytes.
+                  extern "C" {
+                      fn rowlet_bot_report(phase: u32, tsv: u32, pid: u32);
+                  }
+                  let w = &state.rowlet_watch;
+                  let phase: u32 = match w.phase {
+                      Phase::Standby => 0,
+                      Phase::WaitRowlet => 1,
+                      Phase::Verify => 2,
+                      Phase::Reverify => 3,
+                      Phase::Normal => 4,
+                      Phase::Shiny => 5,
+                      Phase::Error => 6,
+                  };
+                  unsafe { rowlet_bot_report(phase, w.tsv as u32, w.pid); }''', 'Rust status report')
 
-      - name: Add movement diagnostic
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          hpath = Path('3gx/sources/hid.c')
-          dpath = Path('3gx/includes/hid.h')
-          mpath = Path('3gx/sources/main.c')
-          h = hpath.read_text()
-          d = dpath.read_text()
-          m = mpath.read_text()
-
-          # No automatic hunting resets during this test.
-          old = '#define V8_MAX_RESETS 2u'
-          if m.count(old) != 1:
-              raise SystemExit('Reset limit anchor missing')
-          m = m.replace(old, '#define V8_MAX_RESETS 0u', 1)
-
-          h += '''
-          // ROWLET_V86_PROBE
-          int rowlet_v86_sample_y(void)
+          h += r'''
+          // ROWLET_V8_INTEGRATED: experimental HID injection for arbitrary button pulse
+          // and Circle Pad UP (the D-pad does not walk in Ultra Sun).
+          bool rowlet_v8_inject(u32 buttons, bool walk_up)
           {
-              if (!g_key_addr) return -999;
+              if (!g_key_addr) return false;
               volatile u32 *base = g_key_addr - (0x28 / 4);
               u32 index = base[0x10 / 4];
-              if (index >= 8) return -998;
-              volatile u32 *sample =
-                  base + (0x28 / 4) + index * 4;
-              return (s16)(sample[3] >> 16);
+              if (index >= 8) return false;
+              volatile u32 *sample = base + (0x28 / 4) + index * (0x10 / 4);
+              u32 spa = svcConvertVAToPA((const void *)sample, false);
+              u32 cpa = svcConvertVAToPA((const void *)(base + (0x1c / 4)), false);
+              if (!spa || !cpa) return false;
+              volatile u32 *s = (volatile u32 *)(spa | 0x80000000u);
+              volatile u32 *cur = (volatile u32 *)(cpa | 0x80000000u);
+              if (buttons) {
+                  s[0] |= buttons;
+                  s[1] |= buttons;
+                  *cur |= buttons;
+              }
+              if (walk_up) {
+                  // HID ring sample word 3: signed circle X in low 16 bits, Y in high.
+                  // Must be confirmed on hardware; if this fails, watchdog stops.
+                  s[3] = (u32)(125u << 16);
+              }
+              return true;
           }
           '''
-
           d += '''
-          int rowlet_v86_sample_y(void);
+          // ROWLET_V8_INTEGRATED
+          bool rowlet_v8_inject(u32 buttons, bool walk_up);
           '''
 
-          anchor = '        // ROWLET_V8_INTEGRATED\n        rowlet_v8_tick();'
-          replacement = '''        v86_pre_y = rowlet_v86_sample_y();
-                  rowlet_v8_tick();
-                  v86_post_y = rowlet_v86_sample_y();'''
-          if m.count(anchor) != 1:
-              raise SystemExit('Frame hook missing')
-          m = m.replace(anchor, replacement, 1)
+          controller = r'''
+          // ROWLET_V8_INTEGRATED
+          // V8.3 experiment: SD-persisted opt-in across soft resets.
+          // Start: hold L + D-Pad UP. Stop: hold L + D-Pad DOWN.
+          // Two resets maximum, one automatic restart, then OFF.
+          // DO NOT use unattended before verifying on-console.
+          #include <stdio.h>
+          #include <3ds/services/fs.h>
 
-          declaration = '''static int v86_pre_y = -999;
-          static int v86_post_y = -999;
+          #define V8_TITLE_ID 0x00040000001B5000ULL
+          #define V8_TSV 3936u
+          #define V8_MAX_RESETS 2u
+          #define V8_MAX_TITLE_FRAMES 6000u
+          #define V8_MAX_TALK_FRAMES 30000u
+          #define V8_SESSION_FILE "/rowlet_v83_session.bin"
+          #define V8_MAGIC 0x33574C52u
+          #define V8_VERSION 1u
+
+          // PokeReader phases: 0 standby, 1 empty, 2 verify, 3 reverify,
+          // 4 verified normal, 5 shiny, 6 invalid.
+          static volatile u32 v8_phase = 0, v8_tsv = 0, v8_pid = 0;
+          static unsigned v8_state = 0;
+          // 0 off, 1 release, 2 empty, 3 walk, 4 advance, 5 verify,
+          // 6 resetting, 7 post-reset autoload, 8 stopped, 9 shiny, 10 error.
+          static unsigned v8_frames=0, v8_hold=0, v8_idle=0;
+          static unsigned v8_error_stage=0;
+          static unsigned v8_fs_error=0;
+          static unsigned v8_resumed=0;
+          static u32 v8_remaining=0;
+          static bool v8_initialized=false;
+          static bool v8_fs_ready=false;
+
+          void rowlet_bot_report(u32 phase, u32 tsv, u32 pid)
+          {
+              v8_phase = phase;
+              v8_tsv = tsv;
+              v8_pid = pid;
+          }
+
+          // Fixed-size marker with checksum. No game saves are modified.
+          static bool v8_write_session(u32 remaining)
+          {
+              if (!v8_fs_ready) return false;
+              u32 words[4] = {
+                  V8_MAGIC, V8_VERSION, remaining,
+                  V8_MAGIC ^ V8_VERSION ^ remaining ^ 0x6A3C8E21u
+              };
+              Handle fd = 0;
+              static const char path[] = V8_SESSION_FILE;
+              Result r = FSUSER_OpenFileDirectly(
+                  &fd, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""),
+                  fsMakePath(PATH_ASCII, path),
+                  FS_OPEN_READ | FS_OPEN_WRITE | FS_OPEN_CREATE, 0);
+              if (R_FAILED(r)) return false;
+              r = FSFILE_SetSize(fd, sizeof(words));
+              if (R_FAILED(r)) { FSFILE_Close(fd); return false; }
+              u32 wrote = 0;
+              r = FSFILE_Write(fd, &wrote, 0, words, sizeof(words), FS_WRITE_FLUSH);
+              FSFILE_Close(fd);
+              return R_SUCCEEDED(r) && wrote == sizeof(words);
+          }
+
+          // 0 inactive/missing, 1 active, -1 corrupt/unreadable.
+          // Invalid marker never authorizes an automated button press.
+          static int v8_read_session(u32 *remaining)
+          {
+              if (!v8_fs_ready) return -1;
+              Handle fd = 0;
+              static const char path[] = V8_SESSION_FILE;
+              Result r = FSUSER_OpenFileDirectly(
+                  &fd, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""),
+                  fsMakePath(PATH_ASCII, path), FS_OPEN_READ, 0);
+              if (R_FAILED(r)) return 0;
+              u32 words[4] = {0,0,0,0};
+              u32 read = 0;
+              r = FSFILE_Read(fd, &read, 0, words, sizeof(words));
+              FSFILE_Close(fd);
+              if (R_FAILED(r) || read != sizeof(words) ||
+                  words[0] != V8_MAGIC || words[1] != V8_VERSION ||
+                  words[2] > V8_MAX_RESETS ||
+                  words[3] != (words[0] ^ words[1] ^ words[2] ^ 0x6A3C8E21u))
+                  return -1;
+              *remaining = words[2];
+              return words[2] > 0 ? 1 : 0;
+          }
+
+          static void v8_stop(unsigned status)
+          {
+              if (v8_state >= 8) return;
+              if (status == 10) v8_error_stage = v8_state;
+              v8_state = status;
+              v8_remaining = 0;
+              // Attempt to disable resume even on failure/abort/shiny.
+              if (v8_fs_ready && !v8_write_session(0))
+                  v8_fs_error = 1;
+          }
+          static void v8_go(unsigned state)
+          {
+              v8_state = state;
+              v8_frames = 0;
+              v8_idle = 0;
+          }
+          static bool v8_a_pulse(unsigned period, unsigned duration)
+          {
+              if ((v8_frames % period) < duration)
+                  return rowlet_v8_inject(KEY_A, false);
+              return true;
+          }
+
+          static void rowlet_v8_tick(void)
+          {
+              if (get_title_id() != V8_TITLE_ID) return;
+              const u32 keys = get_current_keys();
+              const u32 arm = KEY_L | KEY_DUP;
+              const u32 stop = KEY_L | KEY_DDOWN;
+
+              if (!v8_initialized) {
+                  v8_initialized = true;
+                  v8_fs_ready = R_SUCCEEDED(fsInit());
+                  if (!v8_fs_ready) { v8_fs_error = 2; v8_state = 10; return; }
+                  u32 saved = 0;
+                  int active = v8_read_session(&saved);
+                  if (active == -1) {
+                      v8_fs_error = 3;
+                      v8_state = 10;
+                      return;
+                  }
+                  if (active == 1) {
+                      v8_remaining = saved;
+                      v8_resumed = 1;
+                      v8_go(7);
+                  }
+              }
+
+              // Emergency stop is recognized even after a diagnostic error.
+              if (keys == stop) {
+                  if (!v8_write_session(0)) v8_fs_error = 4;
+                  v8_remaining = 0;
+                  v8_state = 8;
+                  return;
+              }
+              if (v8_state >= 8) return;
+
+              if (v8_state == 0) {
+                  v8_hold = (keys == arm) ? v8_hold + 1 : 0;
+                  if (v8_hold >= 60) {
+                      v8_hold = 0;
+                      if (!v8_write_session(V8_MAX_RESETS)) {
+                          v8_fs_error = 5;
+                          v8_state = 10;
+                          return;
+                      }
+                      v8_remaining = V8_MAX_RESETS;
+                      v8_go(1);
+                  }
+                  return;
+              }
+              if (v8_state == 1) {
+                  v8_idle = (keys == 0) ? v8_idle + 1 : 0;
+                  if (v8_idle >= 15) v8_go(2);
+                  if (++v8_frames > 900) v8_stop(10);
+                  return;
+              }
+              // Ignore only the virtual keys this state may have sent last frame.
+              // Real emergency L+DOWN is always checked first.
+              u32 expected_virtual = 0;
+              if (v8_state == 4 || v8_state == 7) expected_virtual = KEY_A;
+              if (v8_state == 6) expected_virtual = KEY_L | KEY_R | KEY_START;
+              if (keys & ~expected_virtual) { v8_stop(8); return; }
+              if (v8_phase == 5) { v8_stop(9); return; }
+              if (v8_phase == 6) { v8_stop(10); return; }
+              ++v8_frames;
+
+              if (v8_state == 7) {
+                  // Restarted process: press A at the title/Continue screen.
+                  // Still requires hardware verification of actual overworld state.
+                  if (v8_frames >= 240 && v8_phase == 1 && v8_tsv == V8_TSV) {
+                      ++v8_idle;
+                      if (v8_idle >= 150) { v8_go(3); return; }
+                  } else {
+                      v8_idle = 0;
+                  }
+                  if (v8_frames > V8_MAX_TITLE_FRAMES) { v8_stop(10); return; }
+                  if (!v8_a_pulse(95, 5)) v8_stop(10);
+                  return;
+              }
+              if (v8_state == 2) {
+                  // First cycle starts from an already-loaded pre-starter save.
+                  if (v8_phase == 1 && v8_tsv == V8_TSV) {
+                      ++v8_idle;
+                      if (v8_idle >= 90) { v8_go(3); return; }
+                  } else v8_idle = 0;
+                  if (v8_frames > V8_MAX_TITLE_FRAMES) v8_stop(10);
+                  return;
+              }
+              if (v8_state == 3) {
+                  if (v8_phase >= 2 && v8_phase <= 4) { v8_go(5); return; }
+                  if (v8_frames < 28 && !rowlet_v8_inject(0, true)) {
+                      v8_stop(10); return;
+                  }
+                  if (v8_frames >= 28) v8_go(4);
+                  return;
+              }
+              if (v8_state == 4) {
+                  if (v8_phase >= 2 && v8_phase <= 4) { v8_go(5); return; }
+                  if (v8_frames > V8_MAX_TALK_FRAMES) { v8_stop(10); return; }
+                  if (!v8_a_pulse(35,6)) v8_stop(10);
+                  return;
+              }
+              if (v8_state == 5) {
+                  if (v8_phase == 4 && v8_tsv == V8_TSV && v8_pid != 0) {
+                      if (v8_remaining == 0) { v8_stop(8); return; }
+                      u32 next = v8_remaining-1;
+                      // Persist the next state *before* attempting a soft reset.
+                      if (!v8_write_session(next)) { v8_fs_error=6; v8_stop(10); return; }
+                      v8_remaining = next;
+                      v8_go(6);
+                      return;
+                  }
+                  if (v8_frames > 1200) v8_stop(10);
+                  return;
+              }
+              if (v8_state == 6) {
+                  if (!rowlet_v8_inject(KEY_L | KEY_R | KEY_START, false)) {
+                      v8_stop(10); return;
+                  }
+                  if (v8_frames >= 45) v8_stop(8);
+                  return;
+              }
+          }
+
+          static void rowlet_v8_overlay(void)
+          {
+              if (get_title_id() != V8_TITLE_ID) return;
+              char buf[160];
+              const char *status="OFF - L+UP";
+              switch (v8_state) {
+              case 1: status="RELEASE BUTTONS"; break;
+              case 2: status="WAIT EMPTY PARTY"; break;
+              case 3: status="WALKING FORWARD"; break;
+              case 4: status="ADVANCING TO ROWLET"; break;
+              case 5: status="VERIFYING SHINY"; break;
+              case 6: status="RESETTING"; break;
+              case 7: status="AUTO-LOADING AFTER RESET"; break;
+              case 8: status="STOPPED"; break;
+              case 9: status="SHINY! STOPPED"; break;
+              case 10: status="ERROR! STOPPED"; break;
+              }
+              snprintf(buf,sizeof(buf),"V8.3 %s | R:%lu P:%lu E:%u FS:%u", status,
+                  (unsigned long)v8_remaining,(unsigned long)v8_phase,
+                  v8_error_stage,v8_fs_error);
+              host_print((u32)buf, strlen(buf), 0x00FF00);
+          }
           '''
-          if m.count('void run_hook(') != 1:
-              raise SystemExit('Run hook missing')
-          m = m.replace(
-              'void run_hook(',
-              declaration + 'void run_hook(',
-              1
-          )
-
-          anchor = '        rowlet_v8_overlay();'
-          replacement = '''        rowlet_v8_overlay();
-                  if (get_title_id() == 0x00040000001B5000ULL) {
-                      char diag[96];
-                      snprintf(diag, sizeof(diag),
-                          "V8.6 PAD Y BEFORE:%d AFTER:%d",
-                          v86_pre_y, v86_post_y);
-                      host_print((u32)diag, strlen(diag), 0x00FFFF);
-                  }'''
-          if m.count(anchor) != 1:
-              raise SystemExit('Overlay anchor missing')
-          m = m.replace(anchor, replacement, 1)
-
-          hpath.write_text(h)
-          dpath.write_text(d)
-          mpath.write_text(m)
-          print('Movement diagnostic installed; auto resets disabled')
-          PY
-
+          m = repl(m,'void run_hook(', controller + 'void run_hook(', 'C controller placement')
+          m = repl(m,'        rowlet_reset_test_tick();',
+                   '        rowlet_reset_test_tick();\n        // ROWLET_V8_INTEGRATED\n        rowlet_v8_tick();',
+                   'C frame tick placement')
+          m = repl(m,'        draw_to_screen(screenId, fb_a, stride, format);',
+                   '        rowlet_v8_overlay();\n        draw_to_screen(screenId, fb_a, stride, format);',
+                   'C overlay placement')
+          for path, data in zip(paths, (m,h,d,f,w)):
+              path.write_text(data)
+          print('V8.3 resumed two-reset test patch installed.')
+          print('Arm L+DPAD-UP then release. Stop L+DPAD-DOWN.')
+          print('First start from loaded save; subsequent reboot attempts auto-resume via SD marker.')
+          ROWLET_V8_SCRIPT
+          python3 /tmp/rowlet_v8_patch.py .
       - name: Compile
         run: |
           docker run --rm \
             -v "$PWD:/work" \
             -w /work \
             zaksabeast/devkitarm-rust make
-
       - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-watch-v8-6-probe
+          name: rowlet-watch-v8-plugin
           path: out/default.3gx
           if-no-files-found: error
