@@ -21,6 +21,9 @@ jobs:
       - name: Apply experimental A-button test
         run: python3 patch/apply_input_test.py .
 
+      - name: Apply manual soft-reset test
+        run: python3 patch/apply_reset_test.py .
+
       - name: Compile
         run: |
           docker run --rm \
