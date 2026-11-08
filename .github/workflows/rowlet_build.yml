@@ -1,5 +1,5 @@
 
-# V12.1: A-only Rowlet starter test. REPLACE .github/workflows/rowlet_build.yml.
+# V12.1: A-only Rowlet starter test
 name: Build Rowlet V12.1 A Spam Shiny Check
 
 'on':
@@ -44,7 +44,6 @@ jobs:
                   raise SystemExit(f'V12.1 {label}: expected one anchor, found {n}; stopped before editing')
               return s.replace(a,b,1)
 
-          # V6 controller really starts with exactly this marker in apply_input_test.py.
           start = '// ROWLET_V6_INPUT_TEST\n\nstatic unsigned int rowlet_a_test_state'
           end = 'void run_hook('
           if m.count(start) != 1 or m.count(end) != 1:
@@ -57,7 +56,7 @@ jobs:
           #define ROWLET_V12_TITLE 0x00040000001B5000ULL
           #define ROWLET_V12_TIMEOUT 10800u
           static volatile u32 v12_phase = 0;
-          static u32 v12_state = 0; /* 0 ready, 1 release trigger, 2 pulses, 3 stop */
+          static u32 v12_state = 0;
           static u32 v12_frame = 0;
           static u32 v12_release = 0;
 
@@ -99,7 +98,6 @@ jobs:
                   v12_state = 3;
                   return;
               }
-              /* Two ON frames, four OFF frames; ~10 distinct A presses/second. */
               bool ok = ((v12_frame % 6u) < 2u) ?
                   rowlet_try_inject_a_frame() : rowlet_try_release_a_frame();
               if (!ok) v12_state = 3;
@@ -108,8 +106,6 @@ jobs:
           '''
           m = m[:a] + controller + m[b:]
 
-          # Patch the actual V6 hook block. The V6 patcher uses a multiline display
-          # whose formatting differs from the older v12 template. Restrict to run_hook.
           run = m.index('void run_hook(')
           start_block = m.index('        scan_input();\n        rowlet_a_test_tick();\n        run_frame();',run)
           end_statement = '        draw_to_screen(screenId, fb_a, stride, format);'
@@ -122,8 +118,6 @@ jobs:
                   rowlet_v12_tick();
                   draw_to_screen(screenId, fb_a, stride, format);'''+m[end_block:]
 
-          # Explicitly clear injected A between pulses, so the game sees new key edges.
-          # Same mapping and checks as the working V6 injection helper.
           release = r'''
           // ROWLET_V12_1: release the virtual A in the current HID sample.
           bool rowlet_try_release_a_frame(void)
@@ -151,8 +145,6 @@ jobs:
               raise SystemExit('V12.1 V6 HID header missing; stopped before editing')
           d += '\n// ROWLET_V12_1\nbool rowlet_try_release_a_frame(void);\n'
 
-          # V5 watcher always ticks, even when overlay is hidden. Report its phase
-          # immediately after that tick, so we never show a guessed shiny value.
           f = rep(f, 'use super::rowlet_watch::{Sample, Watch};',
                   'use super::rowlet_watch::{Sample, Watch, Phase};','Rust phase import')
           status = '''    if is_ultra_sun {
@@ -179,11 +171,9 @@ jobs:
               }
 
           '''
-          # Watcher original insertion comes directly from patch/apply_patch.py.
           watcher_end = '            shiny: mon.is_shiny(),\n        });\n    }\n\n'
           f = rep(f, watcher_end, watcher_end+status, 'Rust V5 watcher tick')
 
-          # Write only when all checks above succeeded.
           for p, value in ((main,m),(hid,h),(hdr,d),(frame,f)):
               p.write_text(value)
           print('V12.1 installed from V5 + V6, one-line shiny status, distinct A pulses.')
@@ -229,4 +219,29 @@ jobs:
           grep -Fq 'ROWLET: SHINY!' reader_core/src/gen7/frame.rs
           grep -Fq 'ROWLET: NOT SHINY' reader_core/src/gen7/frame.rs
           if grep -Fq 'rowlet_a_test_tick();' 3gx/sources/main.c; then
-            echo 'Old V6 hook survived'
+            echo 'Old V6 hook survived' >&2
+            exit 1
+          fi
+
+      - name: Build PokeReader plugin
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/work" -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v12_1_compile.log
+
+      - name: Upload 3GX
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v12-1-a-spam-shiny
+          path: out/default.3gx
+          if-no-files-found: error
+
+      - name: Upload compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v12-1-compile-log
+          path: rowlet_v12_1_compile.log
+          if-no-files-found: warn
