@@ -10,12 +10,16 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Apply Rowlet patch
         run: python3 patch/apply_patch.py .
+
+      - name: Apply experimental A-button test
+        run: python3 patch/apply_input_test.py .
 
       - name: Compile
         run: |
