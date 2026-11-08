@@ -1,9 +1,6 @@
 
-# Rowlet V12: fast A pulses + verified V5 shiny status (no resets)
-# For the existing PokemonPlayer331/PokeReader repo.
-# Hold the Circle Pad up physically; start with L+R+Y; B stops.
-# NO injected movement or reset buttons.
-name: Build Rowlet V12 A Spam Shiny Check
+# V12.1: A-only Rowlet starter test. REPLACE .github/workflows/rowlet_build.yml.
+name: Build Rowlet V12.1 A Spam Shiny Check
 
 'on':
   workflow_dispatch:
@@ -15,146 +12,150 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout source
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Apply existing Rowlet Watch V5
+      - name: Apply V5 decoded Rowlet watcher
         run: python3 patch/apply_patch.py .
 
-      - name: Apply working V6 virtual A bridge
+      - name: Apply V6 working A-input bridge
         run: python3 patch/apply_input_test.py .
 
-      - name: Install V12 A pulses and minimal shiny result
+      - name: Replace V6 test with V12.1 A pulses and shiny-only status
         shell: bash
         run: |
-          cat > /tmp/rowlet_v12_patch.py <<'PY'
+          cat > /tmp/rowlet_v12_1_patch.py <<'PY'
           #!/usr/bin/env python3
-          """V12 A-only + verified Rowlet Watch, minimal single-line overlay.
-          Apply to a clean checkout AFTER V5 and V6 patchers.
-          No movement injection. No reset injection. No automatic rearming.
-          """
+          """V12.1 A pulses and Rowlet Watch status, applied AFTER repo V5 + V6 patches."""
           from pathlib import Path
 
-          root = Path('.')
-          main = root / '3gx/sources/main.c'
-          hid = root / '3gx/sources/hid.c'
-          frame = root / 'reader_core/src/gen7/frame.rs'
-          for target in (main, hid, frame):
-              if not target.exists():
-                  raise RuntimeError(f'Missing {target}')
-          m, h, f = (main.read_text(), hid.read_text(), frame.read_text())
+          main = Path('3gx/sources/main.c')
+          hid = Path('3gx/sources/hid.c')
+          hdr = Path('3gx/includes/hid.h')
+          frame = Path('reader_core/src/gen7/frame.rs')
+          for p in (main, hid, hdr, frame):
+              if not p.is_file():
+                  raise SystemExit(f'V12.1 missing source: {p}')
+          m, h, d, f = (p.read_text() for p in (main, hid, hdr, frame))
 
-          def repl(src, old, new, label):
-              found = src.count(old)
-              if found != 1:
-                  raise RuntimeError(f'{label}: expected 1 match, found {found}')
-              return src.replace(old, new, 1)
+          def rep(s, a, b, label):
+              n=s.count(a)
+              if n!=1:
+                  raise SystemExit(f'V12.1 {label}: expected one anchor, found {n}; stopped before editing')
+              return s.replace(a,b,1)
 
-          # V10.7: compile-safe include for the already hardware-tested V6 A injection.
-          h = repl(h, '#include "common.h"',
-                   '#include "common.h"\n#include "csvc.h"', 'V6 HID include')
-
-          # Drop the entire V6 test controller (including its old X-key trigger).
-          start = '// ROWLET_V6_INPUT_TEST: manually triggered single-A experiment.'
+          # V6 controller really starts with exactly this marker in apply_input_test.py.
+          start = '// ROWLET_V6_INPUT_TEST\n\nstatic unsigned int rowlet_a_test_state'
           end = 'void run_hook('
           if m.count(start) != 1 or m.count(end) != 1:
-              raise RuntimeError('V6 controller anchor missing or ambiguous')
-          a = m.index(start)
-          b = m.index(end, a)
+              raise SystemExit('V12.1 actual V6 controller anchors missing; stopped before editing')
+          a, b = m.index(start), m.index(end)
+          if a >= b:
+              raise SystemExit('V12.1 V6 controller order invalid')
 
-          controller = r"""
-          // ROWLET_V12: only injects A; no analog movement or reset commands.
+          controller = r'''// ROWLET_V12_1: virtual A only; no injected motion, no reset.
           #define ROWLET_V12_TITLE 0x00040000001B5000ULL
-          #define ROWLET_V12_LIMIT (60u * 180u) // 3-min safety timeout, approx.
-          static volatile u32 rowlet_v12_phase = 0;  // reported by verified Rust watcher
-          static u32 rowlet_v12_state = 0; // 0 ready, 1 release, 2 A pulses, 3 stopped
-          static u32 rowlet_v12_frame = 0;
-          static u32 rowlet_v12_released = 0;
+          #define ROWLET_V12_TIMEOUT 10800u
+          static volatile u32 v12_phase = 0;
+          static u32 v12_state = 0; /* 0 ready, 1 release trigger, 2 pulses, 3 stop */
+          static u32 v12_frame = 0;
+          static u32 v12_release = 0;
 
-          // Rust reports its validated Rowlet Watch phase; never guess from raw RAM.
-          void rowlet_v12_report(u32 phase) { rowlet_v12_phase = phase; }
+          void rowlet_v12_report(u32 phase) { v12_phase = phase; }
 
           static void rowlet_v12_tick(void)
           {
               if (get_title_id() != ROWLET_V12_TITLE) return;
               const u32 keys = get_current_keys();
-              const u32 start = KEY_L | KEY_R | KEY_Y; // no X key
-
-              // Physical B always stops scripted presses. A shiny, non-shiny,
-              // or invalid/unknown record stops the script before further injections.
-              if (keys & KEY_B || rowlet_v12_phase == 4 ||
-                  rowlet_v12_phase == 5 || rowlet_v12_phase == 6) {
-                  rowlet_v12_state = 3;
+              const u32 trigger = KEY_L | KEY_R | KEY_Y;
+              if ((keys & KEY_B) || v12_phase >= 4) {
+                  if (v12_state == 2) rowlet_try_release_a_frame();
+                  v12_state = 3;
                   return;
               }
-              if (rowlet_v12_state == 0) {
-                  if ((keys & start) == start) {
-                      rowlet_v12_frame = 0;
-                      rowlet_v12_released = 0;
-                      rowlet_v12_state = 1;
+              if (v12_state == 0) {
+                  if ((keys & trigger) == trigger) {
+                      v12_state = 1;
+                      v12_frame = 0;
+                      v12_release = 0;
                   }
                   return;
               }
-              if (rowlet_v12_state == 1) {
-                  // A held-up circle pad is allowed; only the activation buttons
-                  // must be released. Abort if the user never releases the chord.
-                  if (!(keys & start)) {
-                      if (++rowlet_v12_released >= 8) {
-                          rowlet_v12_state = 2;
-                          rowlet_v12_frame = 0;
+              if (v12_state == 1) {
+                  if ((keys & trigger) == 0) {
+                      if (++v12_release >= 8) {
+                          v12_state = 2;
+                          v12_frame = 0;
                       }
                   } else {
-                      rowlet_v12_released = 0;
+                      v12_release = 0;
                   }
-                  if (++rowlet_v12_frame > 600u) rowlet_v12_state = 3;
+                  if (++v12_frame > 600) v12_state = 3;
                   return;
               }
-              if (rowlet_v12_state != 2) return;
-              if (rowlet_v12_frame >= ROWLET_V12_LIMIT) {
-                  rowlet_v12_state = 3;
+              if (v12_state != 2) return;
+              if (v12_frame++ >= ROWLET_V12_TIMEOUT) {
+                  rowlet_try_release_a_frame();
+                  v12_state = 3;
                   return;
               }
-              // 2 frames ON, 4 OFF = up to ~10 A pulses/sec at 60 FPS.
-              // The off frames let the game see new A press edges.
-              if ((rowlet_v12_frame % 6u) < 2u) {
-                  if (!rowlet_try_inject_a_frame()) {
-                      rowlet_v12_state = 3;
-                      return;
-                  }
-              }
-              rowlet_v12_frame++;
+              /* Two ON frames, four OFF frames; ~10 distinct A presses/second. */
+              bool ok = ((v12_frame % 6u) < 2u) ?
+                  rowlet_try_inject_a_frame() : rowlet_try_release_a_frame();
+              if (!ok) v12_state = 3;
           }
-          """
-          m = m[:a] + controller + '\n' + m[b:]
 
-          # Render detector text only: remove the original V6 diagnostic overlay.
-          v6_hook = """        scan_input();
-                  rowlet_a_test_tick();
-                  run_frame();
-                  if (get_title_id() == 0x00040000001B5000ULL)
-                  {
-                      const char *label = 0;
-                      if (rowlet_a_test_state == 0) label = "A TEST READY: L+X+Y";
-                      if (rowlet_a_test_state == 1) label = "A TEST: PULSING";
-                      if (rowlet_a_test_state == 2) label = "A TEST: ATTEMPTED";
-                      if (rowlet_a_test_state == 3) label = "A TEST: FAILED/CANCELLED";
-                      if (label) host_print((u32)label, strlen(label), 0x00ff00);
-                  }
-                  draw_to_screen(screenId, fb_a, stride, format);"""
-          v12_hook = """        scan_input();
+          '''
+          m = m[:a] + controller + m[b:]
+
+          # Patch the actual V6 hook block. The V6 patcher uses a multiline display
+          # whose formatting differs from the older v12 template. Restrict to run_hook.
+          run = m.index('void run_hook(')
+          start_block = m.index('        scan_input();\n        rowlet_a_test_tick();\n        run_frame();',run)
+          end_statement = '        draw_to_screen(screenId, fb_a, stride, format);'
+          end_block = m.index(end_statement,start_block)+len(end_statement)
+          old_block = m[start_block:end_block]
+          if 'A TEST READY: L+X+Y' not in old_block or old_block.count('draw_to_screen(')!=1:
+              raise SystemExit('V12.1 V6 overlay has unexpected structure; stopped before editing')
+          m = m[:start_block]+'''        scan_input();
                   run_frame();
                   rowlet_v12_tick();
-                  draw_to_screen(screenId, fb_a, stride, format);"""
-          m = repl(m, v6_hook, v12_hook, 'V6 render hook')
+                  draw_to_screen(screenId, fb_a, stride, format);'''+m[end_block:]
 
-          # V5's watcher already has decoded valid-mon/PID/shiny confirmation.
-          # Report that state to the C input driver, then return early to avoid the
-          # large original PokeReader menus and diagnostics on Ultra Sun.
-          f = repl(f, 'use super::rowlet_watch::{Sample, Watch};',
-                   'use super::rowlet_watch::{Sample, Watch, Phase};',
-                   'V5 Rust import')
-          status_hook = """    if is_ultra_sun {
-                  // V12: status is derived ONLY from the verified Rowlet Watch.
+          # Explicitly clear injected A between pulses, so the game sees new key edges.
+          # Same mapping and checks as the working V6 injection helper.
+          release = r'''
+          // ROWLET_V12_1: release the virtual A in the current HID sample.
+          bool rowlet_try_release_a_frame(void)
+          {
+              if (!g_key_addr) return false;
+              volatile u32 *base = g_key_addr - (0x28 / 4);
+              u32 index = base[0x10 / 4];
+              if (index >= 8) return false;
+              volatile u32 *sample = base + (0x28 / 4) + index * (0x10 / 4);
+              u32 sample_pa = svcConvertVAToPA((const void *)sample, false);
+              u32 current_pa = svcConvertVAToPA((const void *)(base + (0x1c / 4)), false);
+              if (!sample_pa || !current_pa) return false;
+              volatile u32 *s = (volatile u32 *)(sample_pa | 0x80000000u);
+              volatile u32 *cur = (volatile u32 *)(current_pa | 0x80000000u);
+              s[0] &= ~KEY_A;
+              s[1] &= ~KEY_A;
+              *cur &= ~KEY_A;
+              return true;
+          }
+          '''
+          if h.count('bool rowlet_try_inject_a_frame(void)')!=1:
+              raise SystemExit('V12.1 V6 HID injection helper missing; stopped before editing')
+          h += release
+          if d.count('bool rowlet_try_inject_a_frame(void);')!=1:
+              raise SystemExit('V12.1 V6 HID header missing; stopped before editing')
+          d += '\n// ROWLET_V12_1\nbool rowlet_try_release_a_frame(void);\n'
+
+          # V5 watcher always ticks, even when overlay is hidden. Report its phase
+          # immediately after that tick, so we never show a guessed shiny value.
+          f = rep(f, 'use super::rowlet_watch::{Sample, Watch};',
+                  'use super::rowlet_watch::{Sample, Watch, Phase};','Rust phase import')
+          status = '''    if is_ultra_sun {
                   let phase = match state.rowlet_watch.phase {
                       Phase::Standby => 0,
                       Phase::WaitRowlet => 1,
@@ -166,36 +167,33 @@ jobs:
                   };
                   extern "C" { fn rowlet_v12_report(phase: u32); }
                   unsafe { rowlet_v12_report(phase); }
-                  let text = match state.rowlet_watch.phase {
+                  let label = match state.rowlet_watch.phase {
                       Phase::Standby | Phase::WaitRowlet => "ROWLET: WAITING",
                       Phase::Verify | Phase::Reverify => "ROWLET: CHECKING",
                       Phase::Normal => "ROWLET: NOT SHINY",
                       Phase::Shiny => "ROWLET: SHINY!",
                       Phase::Error => "ROWLET: ERROR",
                   };
-                  pnp::println!("{}", text);
+                  pnp::println!("{}", label);
                   return;
               }
 
-          """
-          # IMPORTANT: report AFTER V5's tick. An earlier V12 version returned
-          # before the watcher ran, leaving the status stuck at WAITING.
+          '''
+          # Watcher original insertion comes directly from patch/apply_patch.py.
           watcher_end = '            shiny: mon.is_shiny(),\n        });\n    }\n\n'
-          f = repl(f, watcher_end, watcher_end + status_hook,
-                   'V5 watcher completion')
+          f = rep(f, watcher_end, watcher_end+status, 'Rust V5 watcher tick')
 
-          # Commit source only after all source invariants are checked.
-          main.write_text(m)
-          hid.write_text(h)
-          frame.write_text(f)
-          print('V12 installed: A-only pulses; single Rowlet status line; no reset.')
+          # Write only when all checks above succeeded.
+          for p, value in ((main,m),(hid,h),(hdr,d),(frame,f)):
+              p.write_text(value)
+          print('V12.1 installed from V5 + V6, one-line shiny status, distinct A pulses.')
           PY
-          python3 /tmp/rowlet_v12_patch.py
+          python3 /tmp/rowlet_v12_1_patch.py
 
-      - name: Fix libctru compatibility
+      - name: Fix toolchain linker compatibility
         shell: bash
         run: |
-          python3 - <<'PY'
+          cat > /tmp/rowlet_v12_compat.py <<'PY'
           from pathlib import Path
           ld = Path('3gx/3gx.ld')
           s = ld.read_text()
@@ -221,34 +219,14 @@ jobs:
                             needle + '\n\nu32 __system_runflags = 0;\nu32 __apt_appid = 0;', 1)
           p.write_text(s)
           PY
+          python3 /tmp/rowlet_v12_compat.py
 
-      - name: Check V12 configuration
+      - name: Verify installed code
         shell: bash
         run: |
           grep -Fq 'rowlet_v12_tick();' 3gx/sources/main.c
+          grep -Fq 'rowlet_try_release_a_frame' 3gx/sources/hid.c
           grep -Fq 'ROWLET: SHINY!' reader_core/src/gen7/frame.rs
           grep -Fq 'ROWLET: NOT SHINY' reader_core/src/gen7/frame.rs
-          grep -Fq 'rowlet_try_inject_a_frame()' 3gx/sources/main.c
-
-      - name: Compile and capture errors
-        shell: bash
-        run: |
-          set -o pipefail
-          docker run --rm -v "$PWD:/work" -w /work \
-            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v12_compile.log
-
-      - name: Upload V12 plugin
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rowlet-v12-A-only-shiny-test
-          path: out/default.3gx
-          if-no-files-found: error
-
-      - name: Upload compile log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rowlet-v12-compile-log
-          path: rowlet_v12_compile.log
-          if-no-files-found: warn
+          if grep -Fq 'rowlet_a_test_tick();' 3gx/sources/main.c; then
+            echo 'Old V6 hook survived'
