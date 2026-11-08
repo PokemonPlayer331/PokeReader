@@ -1,5 +1,4 @@
-
-name: Rowlet V8.9 Rehid Movement Test NEW
+name: Rowlet V9.0 Fast Circle Pad Movement Test
 
 on: [push, workflow_dispatch]
 
@@ -41,20 +40,25 @@ jobs:
                   raise SystemExit(f'V8.9: expected 1 anchor, got {count}: {old[:85]!r}')
               s = s.replace(old, new, 1)
 
-          # Inject virtual D-pad Up for Rehid to remap.
+          # This is a real DIFFERENT movement test: inject D-pad Up as a
+          # virtual button, hoping Rehid maps it to Circle Pad Up.
           replace('if (v8_frames < 28 && !rowlet_v8_inject(0, true)) {',
                   'if (v8_frames < 28 && !rowlet_v8_inject(KEY_DUP, false)) {')
 
+          # Don't interpret an injected D-pad/CPAD flag as the user pressing
+          # a key and abort the experiment.
           replace('if (v8_state == 6) expected_virtual = KEY_L | KEY_R | KEY_START;',
                   'if (v8_state == 6) expected_virtual = KEY_L | KEY_R | KEY_START;\n'
                   '    if (v8_state == 3) expected_virtual = KEY_DUP | KEY_CPAD_UP;')
 
+          # No D-pad on the trigger: Rehid already remaps D-pad Up.
           replace('const u32 arm = KEY_L | KEY_DUP;',
                   'const u32 arm = KEY_L | KEY_R | KEY_B;')
           replace('const u32 stop = KEY_L | KEY_DDOWN;',
                   'const u32 stop = KEY_L | KEY_R | KEY_Y;')
 
-          # Disable persistence and automatic activation.
+          # Disable SD-session persistence: no automatic activation or resets.
+          # This deliberately ignores any marker from an older build.
           def replace_span(begin, finish, new):
               global s
               if s.count(begin) != 1 or s.count(finish) != 1:
@@ -75,14 +79,14 @@ jobs:
                        '            v8_remaining = 0;')
           replace('        if (!v8_write_session(0)) v8_fs_error = 4;\n', '')
 
-          # Completely disable the automated reset state.
+          # Make the reset state an unconditional stop (defense in depth).
           replace_span('    if (v8_state == 6) {',
                        '\n}\n\nstatic void rowlet_v8_overlay',
                        '    if (v8_state == 6) { v8_stop(8); return; }'
                        '\n}\n\nstatic void rowlet_v8_overlay')
           replace('#define V8_MAX_RESETS 2u', '#define V8_MAX_RESETS 0u')
 
-          # Unique on-screen version and controls.
+          # Unique overlay text: immediately proves this new plugin loaded.
           replace('const char *status="OFF - L+UP";',
                   'const char *status="OFF - L+R+B";')
           replace('case 3: status="WALKING FORWARD";',
@@ -91,8 +95,8 @@ jobs:
                   '"V8.9 %s | R:%lu P:%lu E:%u FS:%u"')
 
           path.write_text(s)
-          print('V8.9: L+R+B start, L+R+Y stop.')
-          print('Automatic resets and session resume DISABLED.')
+          print('V8.9 installed: L+R+B start, L+R+Y stop, virtual D-pad movement.')
+          print('V8.9: session auto-resume OFF, ALL automatic soft resets OFF.')
           PY
 
       - name: Validate V8.9 version and safety markers
@@ -103,6 +107,127 @@ jobs:
           grep -Fq 'rowlet_v8_inject(KEY_DUP, false)' 3gx/sources/main.c
           grep -Fq '#define V8_MAX_RESETS 0u' 3gx/sources/main.c
 
+      - name: Apply V9.0 high-frequency Circle Pad movement
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          
+          hpath = Path('3gx/sources/hid.c')
+          dpath = Path('3gx/includes/hid.h')
+          mpath = Path('3gx/sources/main.c')
+          h, d, m = hpath.read_text(), dpath.read_text(), mpath.read_text()
+          
+          def once(s, old, new, label):
+              hits = s.count(old)
+              if hits != 1:
+                  raise SystemExit(f'V9.0: {label}: expected 1 anchor, saw {hits}')
+              return s.replace(old, new, 1)
+          
+          # Refresh the newest HID sample around every 2ms while walking.
+          # Unlike V8.9, this doesn't inject a D-pad button for Rehid to remap.
+          h += r'''
+          
+          // ROWLET_V90_HIGH_FREQ_CPAD
+          // Experimental helper thread, idle unless movement is armed.
+          static volatile unsigned v90_lease = 0;
+          static bool v90_thread_running = false;
+          
+          static void rowlet_v90_worker(void *unused)
+          {
+              (void)unused;
+              while (true) {
+                  if (v90_lease == 0) {
+                      svcSleepThread(12000000LL); // 12 ms idle
+                      continue;
+                  }
+                  --v90_lease;
+                  if (g_key_addr) {
+                      volatile u32 *base = g_key_addr - (0x28 / 4);
+                      u32 i = base[0x10 / 4];
+                      if (i < 8) {
+                          volatile u32 *slot = base + (0x28 / 4) + i * (0x10 / 4);
+                          u32 pa = svcConvertVAToPA((const void *)slot, false);
+                          if (pa) {
+                              volatile u32 *s = (volatile u32 *)(pa | 0x80000000u);
+                              s[3] = (u32)(145u << 16);
+                              s[0] = (s[0] & ~(KEY_CPAD_DOWN | KEY_CPAD_LEFT |
+                                                KEY_CPAD_RIGHT)) | KEY_CPAD_UP;
+                              s[1] |= KEY_CPAD_UP;
+                              s[2] &= ~KEY_CPAD_UP;
+                          }
+                      }
+                  }
+                  svcSleepThread(2000000LL); // 2ms, quicker than HID sample interval
+              }
+          }
+          
+          bool rowlet_v90_walk_keepalive(void)
+          {
+              if (!g_key_addr) return false;
+              if (!v90_thread_running) {
+                  Thread t = threadCreate(rowlet_v90_worker, NULL, 8192,
+                                          0x26, -2, true);
+                  if (!t) return false;
+                  v90_thread_running = true;
+              }
+              v90_lease = 35; // expires after ~70ms without a frame refresh
+              return true;
+          }
+          
+          void rowlet_v90_walk_off(void)
+          {
+              v90_lease = 0;
+          }
+          '''
+          
+          d += '''
+          // ROWLET_V90_HIGH_FREQ_CPAD
+          bool rowlet_v90_walk_keepalive(void);
+          void rowlet_v90_walk_off(void);
+          '''
+          
+          m = once(m,
+              'if (v8_frames < 28 && !rowlet_v8_inject(KEY_DUP, false)) {',
+              'if (v8_frames < 55 && !rowlet_v90_walk_keepalive()) {',
+              'replace virtual D-pad with high-frequency Circle Pad')
+          m = once(m,
+              'if (v8_frames >= 28) v8_go(4);',
+              'if (v8_frames >= 55) v8_go(4);',
+              'bound walking phase')
+          m = once(m,
+              'if (v8_state == 3) expected_virtual = KEY_DUP | KEY_CPAD_UP;',
+              'if (v8_state == 3) expected_virtual = KEY_CPAD_UP;',
+              'filter synthetic Circle Pad key')
+          m = once(m,
+              'static void v8_stop(unsigned status)\n{\n',
+              'static void v8_stop(unsigned status)\n{\n    rowlet_v90_walk_off();\n',
+              'stop movement on safety stop')
+          m = once(m,
+              'static void v8_go(unsigned state)\n{\n',
+              'static void v8_go(unsigned state)\n{\n    if (state != 3) rowlet_v90_walk_off();\n',
+              'stop movement on state transition')
+          m = once(m, 'V8.9 %s | R:%lu P:%lu E:%u FS:%u',
+                   'V9.0 %s | R:%lu P:%lu E:%u FS:%u', 'version label')
+          m = once(m, 'case 3: status="WALK VIA REHID";',
+                   'case 3: status="FAST CPAD WALK";', 'walking status')
+          
+          hpath.write_text(h)
+          dpath.write_text(d)
+          mpath.write_text(m)
+          print('V9.0 fast circle-pad helper installed; no Rehid remap needed.')
+          print('Automatic resets and auto-resume remain DISABLED.')
+          PYCODE
+
+      - name: Validate V9.0 safe movement patch
+        run: |
+          grep -Fq 'V9.0 %s' 3gx/sources/main.c
+          grep -Fq 'FAST CPAD WALK' 3gx/sources/main.c
+          grep -Fq 'rowlet_v90_walk_keepalive()' 3gx/sources/main.c
+          grep -Fq 'ROWLET_V90_HIGH_FREQ_CPAD' 3gx/sources/hid.c
+          grep -Fq '#define V8_MAX_RESETS 0u' 3gx/sources/main.c
+          ! grep -Fq 'rowlet_v8_inject(KEY_L | KEY_R | KEY_START, false)' 3gx/sources/main.c
+
       - name: Compile new plugin
         run: |
           docker run --rm \
@@ -110,9 +235,9 @@ jobs:
             -w /work \
             zaksabeast/devkitarm-rust make
 
-      - name: Upload V8.9 plugin
+      - name: Upload V9.0 plugin
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v8-9-NEW-rehid-test
+          name: rowlet-v9-0-fast-cpad-test
           path: out/default.3gx
           if-no-files-found: error
