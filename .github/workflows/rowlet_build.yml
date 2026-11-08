@@ -1,4 +1,5 @@
-name: Rowlet V9.0 Fast Circle Pad Movement Test
+
+name: Rowlet V9.0 Debug Build With Visible Errors
 
 on: [push, workflow_dispatch]
 
@@ -40,25 +41,18 @@ jobs:
                   raise SystemExit(f'V8.9: expected 1 anchor, got {count}: {old[:85]!r}')
               s = s.replace(old, new, 1)
 
-          # This is a real DIFFERENT movement test: inject D-pad Up as a
-          # virtual button, hoping Rehid maps it to Circle Pad Up.
           replace('if (v8_frames < 28 && !rowlet_v8_inject(0, true)) {',
                   'if (v8_frames < 28 && !rowlet_v8_inject(KEY_DUP, false)) {')
 
-          # Don't interpret an injected D-pad/CPAD flag as the user pressing
-          # a key and abort the experiment.
           replace('if (v8_state == 6) expected_virtual = KEY_L | KEY_R | KEY_START;',
                   'if (v8_state == 6) expected_virtual = KEY_L | KEY_R | KEY_START;\n'
                   '    if (v8_state == 3) expected_virtual = KEY_DUP | KEY_CPAD_UP;')
 
-          # No D-pad on the trigger: Rehid already remaps D-pad Up.
           replace('const u32 arm = KEY_L | KEY_DUP;',
                   'const u32 arm = KEY_L | KEY_R | KEY_B;')
           replace('const u32 stop = KEY_L | KEY_DDOWN;',
                   'const u32 stop = KEY_L | KEY_R | KEY_Y;')
 
-          # Disable SD-session persistence: no automatic activation or resets.
-          # This deliberately ignores any marker from an older build.
           def replace_span(begin, finish, new):
               global s
               if s.count(begin) != 1 or s.count(finish) != 1:
@@ -79,14 +73,12 @@ jobs:
                        '            v8_remaining = 0;')
           replace('        if (!v8_write_session(0)) v8_fs_error = 4;\n', '')
 
-          # Make the reset state an unconditional stop (defense in depth).
           replace_span('    if (v8_state == 6) {',
                        '\n}\n\nstatic void rowlet_v8_overlay',
                        '    if (v8_state == 6) { v8_stop(8); return; }'
                        '\n}\n\nstatic void rowlet_v8_overlay')
           replace('#define V8_MAX_RESETS 2u', '#define V8_MAX_RESETS 0u')
 
-          # Unique overlay text: immediately proves this new plugin loaded.
           replace('const char *status="OFF - L+UP";',
                   'const char *status="OFF - L+R+B";')
           replace('case 3: status="WALKING FORWARD";',
@@ -112,27 +104,25 @@ jobs:
         run: |
           python3 - <<'PYCODE'
           from pathlib import Path
-          
+
           hpath = Path('3gx/sources/hid.c')
           dpath = Path('3gx/includes/hid.h')
           mpath = Path('3gx/sources/main.c')
           h, d, m = hpath.read_text(), dpath.read_text(), mpath.read_text()
-          
+
           def once(s, old, new, label):
               hits = s.count(old)
               if hits != 1:
                   raise SystemExit(f'V9.0: {label}: expected 1 anchor, saw {hits}')
               return s.replace(old, new, 1)
-          
-          # Refresh the newest HID sample around every 2ms while walking.
-          # Unlike V8.9, this doesn't inject a D-pad button for Rehid to remap.
+
           h += r'''
-          
+
           // ROWLET_V90_HIGH_FREQ_CPAD
           // Experimental helper thread, idle unless movement is armed.
           static volatile unsigned v90_lease = 0;
           static bool v90_thread_running = false;
-          
+
           static void rowlet_v90_worker(void *unused)
           {
               (void)unused;
@@ -158,10 +148,10 @@ jobs:
                           }
                       }
                   }
-                  svcSleepThread(2000000LL); // 2ms, quicker than HID sample interval
+                  svcSleepThread(2000000LL); // 2ms
               }
           }
-          
+
           bool rowlet_v90_walk_keepalive(void)
           {
               if (!g_key_addr) return false;
@@ -171,22 +161,22 @@ jobs:
                   if (!t) return false;
                   v90_thread_running = true;
               }
-              v90_lease = 35; // expires after ~70ms without a frame refresh
+              v90_lease = 35;
               return true;
           }
-          
+
           void rowlet_v90_walk_off(void)
           {
               v90_lease = 0;
           }
           '''
-          
+
           d += '''
           // ROWLET_V90_HIGH_FREQ_CPAD
           bool rowlet_v90_walk_keepalive(void);
           void rowlet_v90_walk_off(void);
           '''
-          
+
           m = once(m,
               'if (v8_frames < 28 && !rowlet_v8_inject(KEY_DUP, false)) {',
               'if (v8_frames < 55 && !rowlet_v90_walk_keepalive()) {',
@@ -211,7 +201,7 @@ jobs:
                    'V9.0 %s | R:%lu P:%lu E:%u FS:%u', 'version label')
           m = once(m, 'case 3: status="WALK VIA REHID";',
                    'case 3: status="FAST CPAD WALK";', 'walking status')
-          
+
           hpath.write_text(h)
           dpath.write_text(d)
           mpath.write_text(m)
@@ -228,12 +218,36 @@ jobs:
           grep -Fq '#define V8_MAX_RESETS 0u' 3gx/sources/main.c
           ! grep -Fq 'rowlet_v8_inject(KEY_L | KEY_R | KEY_START, false)' 3gx/sources/main.c
 
-      - name: Compile new plugin
+      - name: Compile and show error on GitHub summary
+        shell: bash
         run: |
+          set +e
           docker run --rm \
             -v "$PWD:/work" \
             -w /work \
-            zaksabeast/devkitarm-rust make
+            zaksabeast/devkitarm-rust make > v90_compile.log 2>&1
+          result=$?
+          cat v90_compile.log
+          if [ "$result" -ne 0 ]; then
+            echo '::error title=V9.0 compilation failed::Open the Summary tab to see the compiler output below.'
+            {
+              echo '## V9.0 compilation error (actual output)'
+              echo "Make/Docker exit code: $result"
+              echo ''
+              echo '```text'
+              tail -n 75 v90_compile.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$result"
+
+      - name: Upload compile log even if failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v9-0-debug-error-log
+          path: v90_compile.log
+          if-no-files-found: ignore
 
       - name: Upload V9.0 plugin
         uses: actions/upload-artifact@v4
