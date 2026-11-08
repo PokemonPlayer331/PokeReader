@@ -1,136 +1,136 @@
 
-name: Build Rowlet V10.4 InputRedirection Dry Run
+#!/usr/bin/env python3
+"""Rowlet V10.4 - Luma3DS Wi-Fi movement test.
 
-on:
-  workflow_dispatch:
+Requires:
+- 2DS XL and computer on the same Wi-Fi
+- Luma3DS InputRedirection enabled
+- rehid configured for D-pad Up to Circle Pad Up
 
-permissions:
-  contents: read
+DRY RUN: No soft reset commands.
+"""
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+import argparse
+import socket
+import struct
+import time
 
-      - name: Apply stable Rowlet Watch patch
-        run: python3 patch/apply_patch.py .
+PORT = 4950
 
-      - name: Label V10.4 dry run on Rowlet Watch screen
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
+# Luma3DS uses active-low button states.
+RELEASED = 0x00000FFF
 
-          p = Path('reader_core/src/gen7/frame.rs')
-          s = p.read_text()
+UP = 1 << 6
+A = 1 << 0
 
-          a = 'pnp::println!("ROWLET WATCH v5");'
-          b = 'pnp::println!("Reset buttons: OFF");'
+TOUCH_RELEASED = 0x02000000
+CIRCLE_CENTER = 0x007FF7FF
+CPP_CENTER = 0x80800081
 
-          assert s.count(a) == 1, 'Rowlet Watch V5 heading not found'
-          assert s.count(b) == 1, 'Rowlet Watch reset status not found'
 
-          s = s.replace(
-              a,
-              'pnp::println!("ROWLET V10.4 REMOTE");',
-              1
-          )
+def packet(keys=0):
+    mask = RELEASED & ~keys
 
-          s = s.replace(
-              b,
-              'pnp::println!("MODE: DRY RUN");\n'
-              '            pnp::println!("Input: PC over WiFi");\n'
-              '            pnp::println!("Reset: DISABLED");',
-              1
-          )
+    return struct.pack(
+        "<IIIII",
+        mask,
+        TOUCH_RELEASED,
+        CIRCLE_CENTER,
+        CPP_CENTER,
+        0
+    )
 
-          p.write_text(s)
-          print('V10.4 overlay labeled; no memory injection')
-          PY
 
-      - name: Fix libctru 2.4.1 compatibility
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
+def send_for(sock, target, keys, duration):
+    end = time.monotonic() + duration
+    data = packet(keys)
 
-          ld = Path('3gx/3gx.ld')
-          code = ld.read_text()
+    while time.monotonic() < end:
+        sock.sendto(data, target)
+        time.sleep(0.02)
 
-          if '__tdata_align' not in code:
-              needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
-              assert needle in code
 
-              code = code.replace(
-                  needle,
-                  needle +
-                  '\n\t\t__tdata_align = .;'
-                  '\n\t\tLONG (ALIGNOF(.tdata));'
-                  '\n\t\t. = ALIGN(4);',
-                  1
-              )
+def main():
+    parser = argparse.ArgumentParser(
+        description="Rowlet V10.4 Wi-Fi dry-run controller"
+    )
 
-          needle = (
-              '\t\t__tls_start = .;\n'
-              '\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
-          )
+    parser.add_argument(
+        "ip",
+        help="3DS IP shown in Rosalina InputRedirection"
+    )
 
-          if needle in code:
-              code = code.replace(
-                  needle,
-                  '\t\t. = 8 + ABSOLUTE(ALIGN('
-                  'ABSOLUTE(. - 8), MAX(4, '
-                  'ALIGNOF(.tdata))));\n'
-                  '\t\t__tls_start = .;\n'
-                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
-                  1
-              )
+    parser.add_argument(
+        "--walk-seconds",
+        type=float,
+        default=2.0
+    )
 
-          ld.write_text(code)
+    parser.add_argument(
+        "--dialog-seconds",
+        type=float,
+        default=90.0
+    )
 
-          src = Path('3gx/sources/main.c')
-          code = src.read_text()
+    args = parser.parse_args()
 
-          if (
-              '__system_runflags' not in code or
-              '__apt_appid' not in code
-          ):
-              needle = 'u32 __ctru_linear_heap_size = 0;'
-              assert needle in code
+    if not (
+        0 < args.walk_seconds <= 15
+        and 0 <= args.dialog_seconds <= 180
+    ):
+        parser.error("Invalid movement or dialogue duration")
 
-              code = code.replace(
-                  needle,
-                  needle +
-                  '\n\nu32 __system_runflags = 0;'
-                  '\nu32 __apt_appid = 0;',
-                  1
-              )
+    target = (args.ip, PORT)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-          src.write_text(code)
-          PY
+    print("ROWLET AUTO V10.4")
+    print("MODE: DRY RUN")
+    print("INPUT: D-PAD + REHID")
+    print("AUTOMATIC RESET: DISABLED")
+    print("Press Ctrl+C to stop.")
 
-      - name: Build plugin and save log
-        shell: bash
-        run: |
-          set -o pipefail
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            zaksabeast/devkitarm-rust make 2>&1 | tee v104_compile.log
+    try:
+        print("Starting in 3 seconds...")
+        time.sleep(3)
 
-      - name: Upload plugin
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rowlet-v10-4-dry-run-plugin
-          path: out/default.3gx
-          if-no-files-found: error
+        # Step 1: Walk forward.
+        print("STEP 1: D-PAD UP")
+        send_for(
+            sock,
+            target,
+            UP,
+            args.walk_seconds
+        )
 
-      - name: Upload compile log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rowlet-v10-4-compile-log
-          path: v104_compile.log
-          if-no-files-found: warn
+        # Release the button.
+        send_for(sock, target, 0, 0.5)
+
+        # Step 2: Advance scene and select Rowlet.
+        print("STEP 2: PRESSING A")
+        print("Watching starter dialogue...")
+
+        end = time.monotonic() + args.dialog_seconds
+
+        while time.monotonic() < end:
+            send_for(sock, target, A, 0.14)
+            send_for(sock, target, 0, 0.65)
+
+        print("DRY RUN COMPLETED")
+        print("No reset sent.")
+        print("Check Rowlet Watch for shiny status.")
+
+    except KeyboardInterrupt:
+        print("STOPPED BY USER")
+        print("No reset sent.")
+
+    finally:
+        # Release all controller buttons.
+        for _ in range(12):
+            sock.sendto(packet(0), target)
+            time.sleep(0.02)
+
+        sock.close()
+
+
+if __name__ == "__main__":
+    main()
