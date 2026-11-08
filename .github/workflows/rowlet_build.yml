@@ -1,5 +1,5 @@
 
-name: Build Rowlet V10.8 Analog Circle Pad + A DRY RUN
+name: Build Rowlet V10.9 One Step Analog Ring + A DRY RUN
 
 on:
   workflow_dispatch:
@@ -20,10 +20,10 @@ jobs:
       - name: Apply original V6 virtual A test
         run: python3 patch/apply_input_test.py .
 
-      - name: Combine V6 input with analog Circle Pad and A test
+      - name: Combine V6 input with one-step analog test
         shell: bash
         run: |
-          cat > /tmp/v108.py <<'PY'
+          cat > /tmp/v109.py <<'PY'
           from pathlib import Path
 
           main = Path('3gx/sources/main.c')
@@ -41,9 +41,8 @@ jobs:
                   )
               return source.replace(old, new, 1)
 
-          # Preserve the working V6 virtual A injection.
-          # Add separate analog movement injection.
-          # No background HID thread.
+          # Retain the previously working virtual A method.
+          # No background HID thread or automatic resets.
           h = once(
               h,
               '#include "common.h"',
@@ -52,12 +51,12 @@ jobs:
           )
 
           h += r'''
-          // V10.8: V6-style virtual button injection.
-          bool rowlet_v108_inject(u32 bits)
+          // V10.9: preserve V6-style A injection.
+          bool rowlet_v109_inject(u32 bits)
           {
               if (!g_key_addr) return false;
 
-              bits &= (KEY_A | KEY_DUP);
+              bits &= KEY_A;
               if (!bits) return false;
 
               volatile u32 *base =
@@ -71,8 +70,7 @@ jobs:
                   + index * (0x10 / 4);
 
               u32 sample_pa = svcConvertVAToPA(
-                  (const void *)sample,
-                  false
+                  (const void *)sample, false
               );
 
               u32 current_pa = svcConvertVAToPA(
@@ -99,217 +97,208 @@ jobs:
 
               return true;
           }
-          '''
 
-          # Circle Pad analog movement test.
-          # HID sample +0x0C stores X and Y.
-          # Positive Y represents Up.
-          h += r'''
-          bool rowlet_v108_analog_up(void)
+          // New experiment: write to all eight PAD
+          // samples instead of only the newest.
+          bool rowlet_v109_step(void)
           {
-              if (!g_key_addr)
-                  return false;
+              if (!g_key_addr) return false;
 
               volatile u32 *base =
                   g_key_addr - (0x28 / 4);
 
               u32 index = base[0x10 / 4];
-
-              if (index >= 8)
-                  return false;
-
-              volatile u32 *sample =
-                  base + (0x28 / 4)
-                  + index * (0x10 / 4);
+              if (index >= 8) return false;
 
               u32 pa = svcConvertVAToPA(
-                  (const void *)sample,
+                  (const void *)(base + (0x28 / 4)),
                   false
               );
 
-              if (!pa)
-                  return false;
+              if (!pa) return false;
 
-              volatile u32 *s =
+              volatile u32 *ring =
                   (volatile u32 *)(
                       pa | 0x80000000u
                   );
 
-              // Preserve analog X.
-              // Set analog Y to +156 (Up).
-              s[3] =
-                  (s[3] & 0x0000ffffu)
-                  | 0x009c0000u;
+              for (u32 i = 0; i < 8; ++i) {
+                  volatile u32 *sample =
+                      ring + 4 * i;
 
-              // Derived Circle Pad Up state.
-              s[0] |= (1u << 30);
+                  // +0xC stores X and Y.
+                  // Preserve X and set Y to +156.
+                  sample[3] =
+                      (sample[3] & 0x0000ffffu)
+                      | 0x009c0000u;
+
+                  // Derived Circle Pad Up direction.
+                  sample[0] |= KEY_CPAD_UP;
+              }
 
               return true;
           }
           '''
 
-          d += '\nbool rowlet_v108_inject(u32 bits);\n'
-          d += 'bool rowlet_v108_analog_up(void);\n'
+          d += '\nbool rowlet_v109_inject(u32 bits);\n'
+          d += 'bool rowlet_v109_step(void);\n'
 
           controller = r'''
-          // V10.8 one-cycle dry run.
+          // V10.9 dry-run state machine.
           // 0 READY
           // 1 RELEASE
-          // 2 ANALOG UP
+          // 2 ONE STEP
           // 3 PRESS A
           // 4 DONE
-          // 5 STOP
+          // 5 STOP / ERROR
 
-          static unsigned v108_state = 0;
-          static unsigned v108_frames = 0;
-          static unsigned v108_idle = 0;
-          static unsigned v108_up_calls = 0;
-          static unsigned v108_a_calls = 0;
+          static unsigned v109_state = 0;
+          static unsigned v109_frames = 0;
+          static unsigned v109_idle = 0;
+          static unsigned v109_up_calls = 0;
+          static unsigned v109_a_calls = 0;
 
-          static const char *v108_error = "";
+          static const char *v109_error = "";
 
-          #define V108_TITLE 0x00040000001B5000ULL
+          #define V109_TITLE 0x00040000001B5000ULL
 
-          static void v108_set(unsigned state)
+          static void v109_set(unsigned state)
           {
-              v108_state = state;
-              v108_frames = 0;
+              v109_state = state;
+              v109_frames = 0;
           }
 
-          static void rowlet_v108_tick(void)
+          static void rowlet_v109_tick(void)
           {
-              if (get_title_id() != V108_TITLE)
+              if (get_title_id() != V109_TITLE)
                   return;
 
               const u32 keys = get_current_keys();
 
-              // Activation: L + R + Y.
-              // No X-button injection.
+              // Start using L + R + Y.
+              // X is never part of the trigger.
               const u32 start =
                   KEY_L | KEY_R | KEY_Y;
 
-              if (v108_state == 0) {
+              if (v109_state == 0) {
                   if (
                       (keys & start) == start &&
                       !(keys & KEY_X)
                   ) {
-                      v108_up_calls = 0;
-                      v108_a_calls = 0;
-                      v108_idle = 0;
-                      v108_set(1);
+                      v109_up_calls = 0;
+                      v109_a_calls = 0;
+                      v109_idle = 0;
+                      v109_set(1);
                   }
 
                   return;
               }
 
-              // Emergency stop: B.
+              // Physical B stops the test.
               if (keys & KEY_B) {
-                  v108_error = "MANUAL STOP";
-                  v108_set(5);
+                  v109_error = "MANUAL STOP";
+                  v109_set(5);
                   return;
               }
 
-              if (v108_state >= 4)
+              if (v109_state >= 4)
                   return;
 
-              if (v108_state == 1) {
-                  // Wait for activation buttons
-                  // to be released.
-                  v108_idle =
+              if (v109_state == 1) {
+                  // Wait until trigger is released.
+                  v109_idle =
                       (keys == 0)
-                      ? v108_idle + 1
+                      ? v109_idle + 1
                       : 0;
 
-                  if (v108_idle >= 15) {
-                      v108_set(2);
-                  }
+                  if (v109_idle >= 15)
+                      v109_set(2);
 
-                  if (++v108_frames > 600) {
-                      v108_error = "RELEASE TIMEOUT";
-                      v108_set(5);
+                  if (++v109_frames > 600) {
+                      v109_error = "RELEASE TIMEOUT";
+                      v109_set(5);
                   }
 
                   return;
               }
 
-              // Stop on unexpected inputs.
               if (
                   (keys & ~(KEY_DUP | KEY_A)) != 0
               ) {
-                  v108_error = "OTHER KEY PRESSED";
-                  v108_set(5);
+                  v109_error = "OTHER KEY PRESSED";
+                  v109_set(5);
                   return;
               }
 
-              if (v108_state == 2) {
-                  // Attempt analog Circle Pad Up
-                  // for 120 rendered frames.
-
-                  if (v108_frames < 120) {
-                      if (!rowlet_v108_analog_up()) {
-                          v108_error = "ANALOG FAILED";
-                          v108_set(5);
+              if (v109_state == 2) {
+                  // One-step experiment:
+                  // maximum 45 rendered frames.
+                  if (v109_frames < 45) {
+                      if (!rowlet_v109_step()) {
+                          v109_error = "STEP FAILED";
+                          v109_set(5);
                           return;
                       }
 
-                      ++v108_up_calls;
+                      ++v109_up_calls;
                   } else {
-                      v108_set(3);
+                      v109_set(3);
                       return;
                   }
               }
 
-              else if (v108_state == 3) {
-                  // Preserve the virtual A technique.
-                  // Ten short A pulses.
-
-                  if (v108_frames < 350) {
-                      if ((v108_frames % 35) < 6) {
+              else if (v109_state == 3) {
+                  // Preserve working A injection.
+                  // Ten short pulses.
+                  if (v109_frames < 350) {
+                      if (
+                          (v109_frames % 35) < 6
+                      ) {
                           if (
-                              !rowlet_v108_inject(KEY_A)
+                              !rowlet_v109_inject(KEY_A)
                           ) {
-                              v108_error = "A INJECT FAILED";
-                              v108_set(5);
+                              v109_error = "A INJECT FAILED";
+                              v109_set(5);
                               return;
                           }
 
-                          ++v108_a_calls;
+                          ++v109_a_calls;
                       }
                   } else {
-                      v108_set(4);
+                      v109_set(4);
                       return;
                   }
               }
 
-              ++v108_frames;
+              ++v109_frames;
           }
 
-          static void rowlet_v108_overlay(void)
+          static void rowlet_v109_overlay(void)
           {
-              if (get_title_id() != V108_TITLE)
+              if (get_title_id() != V109_TITLE)
                   return;
 
               const char *state = "READY";
 
-              if (v108_state == 1)
+              if (v109_state == 1)
                   state = "RELEASE";
 
-              if (v108_state == 2)
-                  state = "ANALOG UP";
+              if (v109_state == 2)
+                  state = "ONE STEP";
 
-              if (v108_state == 3)
+              if (v109_state == 3)
                   state = "PRESS A";
 
-              if (v108_state == 4)
+              if (v109_state == 4)
                   state = "DONE";
 
-              if (v108_state == 5)
+              if (v109_state == 5)
                   state = "STOP/ERROR";
 
               char buf[64];
 
               host_print(
-                  (u32)"ROWLET V10.8 DRY",
+                  (u32)"ROWLET V10.9 DRY",
                   16,
                   0x00ffff
               );
@@ -336,9 +325,9 @@ jobs:
               snprintf(
                   buf,
                   sizeof(buf),
-                  "UP:%u A:%u",
-                  v108_up_calls,
-                  v108_a_calls
+                  "ST:%u A:%u",
+                  v109_up_calls,
+                  v109_a_calls
               );
 
               host_print(
@@ -356,8 +345,8 @@ jobs:
               'controller location'
           )
 
-          # Replace original V6 test execution.
-          # Put counters on main PokeReader popup.
+          # Replace original V6 execution while
+          # preserving the main popup.
           hook_start = (
               '        scan_input();\n'
               '        rowlet_a_test_tick();\n'
@@ -374,7 +363,7 @@ jobs:
               or m.count(hook_end) != 1
           ):
               raise RuntimeError(
-                  'Expected unique V6 overlay hook not found'
+                  'V6 overlay hook not found'
               )
 
           a = m.index(hook_start)
@@ -386,9 +375,9 @@ jobs:
           m = (
               m[:a]
               + '        scan_input();\n'
-              + '        rowlet_v108_tick();\n'
+              + '        rowlet_v109_tick();\n'
               + '        run_frame();\n'
-              + '        rowlet_v108_overlay();\n'
+              + '        rowlet_v109_overlay();\n'
               + hook_end
               + m[b:]
           )
@@ -397,14 +386,14 @@ jobs:
           hid.write_text(h)
           header.write_text(d)
 
-          print("V10.8 analog input test patched")
+          print("V10.9 patch applied")
           print("Trigger: L + R + Y")
-          print("Movement: Analog Circle Pad Up")
-          print("Virtual A: Enabled")
-          print("Automatic reset: DISABLED")
+          print("Movement: analog input ring test")
+          print("A injection: V6 method")
+          print("Reset: DISABLED")
           PY
 
-          python3 /tmp/v108.py
+          python3 /tmp/v109.py
 
       - name: Fix libctru 2.4.1 compatibility
         shell: bash
@@ -484,13 +473,13 @@ jobs:
             -v "$PWD:/work" \
             -w /work \
             zaksabeast/devkitarm-rust make \
-            2>&1 | tee v108_compile.log
+            2>&1 | tee v109_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-8-dry-test
+          name: rowlet-v10-9-dry-test
           path: out/default.3gx
           if-no-files-found: error
 
@@ -498,6 +487,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-8-compile-log
-          path: v108_compile.log
+          name: rowlet-v10-9-compile-log
+          path: v109_compile.log
           if-no-files-found: warn
