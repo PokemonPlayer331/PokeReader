@@ -101,7 +101,7 @@ jobs:
                   });
                   // ROWLET_V8_INTEGRATED: report decoded and verified read-only status.
                   // C never calculates shiny status on unvalidated encrypted bytes.
-                  unsafe extern "C" {
+                  extern "C" {
                       fn rowlet_bot_report(phase: u32, tsv: u32, pid: u32);
                   }
                   let w = &state.rowlet_watch;
