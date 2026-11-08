@@ -1,5 +1,5 @@
 
-name: Build Rowlet AUTO v10.2 FIXED
+name: Build Rowlet AUTO v10.2.1
 
 on:
   workflow_dispatch:
@@ -17,12 +17,11 @@ jobs:
       - name: Apply Rowlet patch
         run: python3 patch/apply_patch.py .
 
-      - name: Add experimental automated Rowlet controller
+      - name: Add Rowlet automated controller
         shell: bash
         run: |
           cat > /tmp/rowlet_auto_patch.py <<'PY'
           #!/usr/bin/env python3
-          """Rowlet AUTO v10.2 - D-pad + rehid dry-run test."""
           from pathlib import Path
 
           root = Path('.').resolve()
@@ -32,17 +31,20 @@ jobs:
               s = p.read_text()
               if s.count(old) != 1:
                   raise RuntimeError(
-                      f'{path}: expected one anchor {old!r}, '
-                      f'found {s.count(old)}'
+                      f'{path}: expected one anchor '
+                      f'{old!r}, found {s.count(old)}'
                   )
               p.write_text(s.replace(old, new, 1))
 
-          # HID input injection bridge.
+          # HID bridge: D-pad + rehid.
           p = root / '3gx/sources/hid.c'
           s = p.read_text()
+
           s += r'''
 
           #include <3ds.h>
+          #include "common.h"
+
           static volatile u32 auto_rowlet_mask = 0;
           static volatile bool auto_rowlet_thread_running = false;
           static volatile bool auto_rowlet_started = false;
@@ -55,7 +57,8 @@ jobs:
           }
 
           bool auto_rowlet_available(void) {
-            return auto_rowlet_started && auto_rowlet_base != 0;
+            return auto_rowlet_started &&
+                   auto_rowlet_base != 0;
           }
 
           static void auto_rowlet_pump(void *unused) {
@@ -72,6 +75,7 @@ jobs:
 
                 if (mem) {
                   u32 idx = mem[0x10 / 4] & 7u;
+
                   vu32 *entry = (vu32 *)(
                       (u8 *)mem + 0x28 + idx * 0x10
                   );
@@ -98,7 +102,9 @@ jobs:
                   true
               );
 
-              if (t) auto_rowlet_started = true;
+              if (t) {
+                auto_rowlet_started = true;
+              }
             }
           }
           '''
@@ -167,7 +173,7 @@ jobs:
               pub fn host_auto_rowlet_available() -> u32;'''
           )
 
-          # Add ability to start a new Watch cycle.
+          # Preserve Watch counters on new cycles.
           for path in (
               'patch/rowlet_watch.rs',
               'reader_core/src/gen7/rowlet_watch.rs'
@@ -183,14 +189,14 @@ jobs:
               fn fail(&mut self, reason: &'static str) {'''
               )
 
-          # Rowlet automation logic.
+          # Rowlet automation.
           auto_rust = r'''
           use super::rowlet_watch::{Phase, Watch};
           use crate::pnp::{self, Button};
 
           const KEY_A: u32 = 1;
 
-          // D-pad Up; rehid mapping is configured on console.
+          // D-pad Up is remapped by rehid.
           const KEY_UP: u32 = 1 << 6;
 
           const MAX_DIALOG_FRAMES: u32 = 120 * 60;
@@ -278,6 +284,7 @@ jobs:
                       }
                   }
 
+                  // Never continue on shiny.
                   if watch.phase == Phase::Shiny {
                       self.set(Step::Shiny);
                   }
@@ -302,7 +309,7 @@ jobs:
                       }
 
                       Step::Dialog => {
-                          // Rowlet is the default first choice.
+                          // Rowlet is the first starter.
 
                           if watch.phase == Phase::Verify ||
                              watch.phase == Phase::Reverify
@@ -328,9 +335,9 @@ jobs:
                       }
 
                       Step::Done => {
-                          // DRY RUN ONLY.
-                          // Stop all automatic input.
-                          // Never soft-reset.
+                          // DRY RUN.
+                          // No automatic soft resets.
+                          // Stop scripted inputs.
                       }
                   }
 
@@ -349,7 +356,7 @@ jobs:
               root / 'reader_core/src/gen7/rowlet_auto.rs'
           ).write_text(auto_rust)
 
-          # Update Watch text.
+          # Adjust Watch text.
           for path in (
               'patch/rowlet_watch.rs',
               'reader_core/src/gen7/rowlet_watch.rs'
@@ -412,7 +419,7 @@ jobs:
               state.sfmt.reinit_if_needed(reader.init_seed());'''
           )
 
-          # FIXED: matches Rowlet Watch V5.
+          # Matches Rowlet Watch V5.
           replace(
               'reader_core/src/gen7/frame.rs',
               ' pnp::println!("Reset buttons: OFF");',
@@ -424,17 +431,16 @@ jobs:
            pnp::println!("Reset commands: DISABLED");'''
           )
 
-          # FIXED: V5, not V4.
           replace(
               'reader_core/src/gen7/frame.rs',
               'pnp::println!("ROWLET WATCH v5");',
-              'pnp::println!("ROWLET AUTO v10.2");'
+              'pnp::println!("ROWLET AUTO v10.2.1");'
           )
 
-          print("Rowlet AUTO v10.2 patched.")
-          print("MODE: DRY RUN")
-          print("INPUT: D-PAD + REHID")
-          print("AUTOMATIC RESET: DISABLED")
+          print("Rowlet AUTO v10.2.1 patched")
+          print("Input: D-pad + rehid")
+          print("Mode: DRY RUN")
+          print("Automatic reset: DISABLED")
           PY
 
           python3 /tmp/rowlet_auto_patch.py
@@ -516,7 +522,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-auto-v10-2-fixed-dry-run
+          name: rowlet-auto-v10-2-1-dry-run
           path: out/default.3gx
           if-no-files-found: error
 
