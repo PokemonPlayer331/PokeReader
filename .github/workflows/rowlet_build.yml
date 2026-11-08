@@ -1,5 +1,5 @@
 
-name: Build Rowlet V11 CTR Stick One Step Dry Run
+name: Build Rowlet V11.1 Stick Trace Diagnostic
 
 on:
   workflow_dispatch:
@@ -14,327 +14,232 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply Rowlet Watch V5
+      - name: Apply original Rowlet Watch V5
         run: python3 patch/apply_patch.py .
 
-      - name: Apply original V6 virtual A test
-        run: python3 patch/apply_input_test.py .
-
-      - name: V11 experimental game-side stick conversion test
+      - name: Instrument candidate stick routine
         shell: bash
         run: |
-          cat > /tmp/v11.py <<'PY'
+          cat > /tmp/v111.py <<'PY'
           from pathlib import Path
 
           main = Path('3gx/sources/main.c')
-          hid = Path('3gx/sources/hid.c')
-          header = Path('3gx/includes/hid.h')
-          m = main.read_text()
-          h = hid.read_text()
-          d = header.read_text()
+          s = main.read_text()
 
-          def once(source, old, new, label):
-              count = source.count(old)
-              if count != 1:
-                  raise RuntimeError(
-                      f'{label}: expected 1 anchor, found {count}'
-                  )
-              return source.replace(old, new, 1)
+          observer = r'''
+          // V11.1 diagnostic, USA Ultra Sun v1.2.
+          #define V111_TITLE 0x00040000001B5000ULL
+          #define V111_TARGET 0x004B6DD8u
+          #define V111_OP0 0xE92D4070u
+          #define V111_OP1 0xE1A04000u
+          #define V111_JUMP 0xE51FF004u
 
-          # Reuse the earlier virtual A input bridge.
-          h = once(
-              h,
-              '#include "common.h"',
-              '#include "common.h"\n#include "csvc.h"',
-              'csvc header'
-          )
+          __attribute__((used))
+          static volatile u32 v111_hits = 0;
 
-          h += r'''
-          // Preserve V6-style virtual A input.
-          bool rowlet_v11_inject(u32 bits)
+          static unsigned v111_hook_status = 0;
+
+          __attribute__((naked, used, noinline, aligned(4)))
+          static void v111_trampoline(void)
           {
-              if (!g_key_addr) return false;
-
-              bits &= KEY_A;
-              if (!bits) return false;
-
-              volatile u32 *base =
-                  g_key_addr - (0x28 / 4);
-
-              u32 index = base[0x10 / 4];
-              if (index >= 8) return false;
-
-              volatile u32 *sample =
-                  base + (0x28 / 4)
-                  + index * (0x10 / 4);
-
-              u32 sample_pa = svcConvertVAToPA(
-                  (const void *)sample, false
+              __asm__ volatile(
+                  ".arm\n"
+                  "stmdb sp!, {r0-r3, r12, lr}\n"
+                  "ldr r12, =v111_hits\n"
+                  "ldr r0, [r12]\n"
+                  "add r0, r0, #1\n"
+                  "str r0, [r12]\n"
+                  "ldmia sp!, {r0-r3, r12, lr}\n"
+                  "stmdb sp!, {r4, r5, r6, lr}\n"
+                  "mov r4, r0\n"
+                  "ldr pc, =0x004B6DE0\n"
               );
-
-              u32 current_pa = svcConvertVAToPA(
-                  (const void *)(base + 0x1c / 4),
-                  false
-              );
-
-              if (!sample_pa || !current_pa)
-                  return false;
-
-              volatile u32 *s =
-                  (volatile u32 *)(
-                      sample_pa | 0x80000000u
-                  );
-
-              volatile u32 *cur =
-                  (volatile u32 *)(
-                      current_pa | 0x80000000u
-                  );
-
-              s[0] |= bits;
-              s[1] |= bits;
-              *cur |= bits;
-
-              return true;
           }
 
-          // Game-side stick conversion experiment.
-          // Target: Ultra Sun v1.2 executable.
-          //
-          // Original:
-          // 0x004B6DF8: ldrsh r1, [r1, #14]
-          //
-          // Temporary replacement:
-          // mov r1, #156
-          //
-          // Changes a Y-coordinate input to full Up.
-          // Does not modify the HID input ring.
-
-          #define V11_STICK_Y_INST 0x004B6DF8u
-          #define V11_STICK_ORIGINAL 0xE1D110FEu
-          #define V11_STICK_UP 0xE3A0109Cu
-
-          static bool v11_patch_active = false;
-          static u32 v11_patch_error = 0;
-
-          u32 rowlet_v11_error(void)
+          static void v111_install(void)
           {
-              return v11_patch_error;
-          }
+              if (get_title_id() != V111_TITLE)
+                  return;
 
-          bool rowlet_v11_set_up(bool enable)
-          {
-              if (!enable && !v11_patch_active)
-                  return true;
+              volatile u32 *code =
+                  (volatile u32 *)V111_TARGET;
 
-              volatile u32 *virtual_word =
-                  (volatile u32 *)V11_STICK_Y_INST;
+              if (
+                  code[0] != V111_OP0 ||
+                  code[1] != V111_OP1
+              ) {
+                  v111_hook_status = 2;
+                  return;
+              }
 
-              // Never patch an unexpected instruction.
-              if (enable &&
-                  !v11_patch_active &&
-                  *virtual_word != V11_STICK_ORIGINAL)
-              {
-                  v11_patch_error = 1;
-                  return false;
+              u32 dest =
+                  (u32)(void *)v111_trampoline;
+
+              if (dest & 3u) {
+                  v111_hook_status = 4;
+                  return;
               }
 
               u32 pa = svcConvertVAToPA(
-                  (const void *)V11_STICK_Y_INST,
+                  (const void *)V111_TARGET,
                   false
               );
 
-              if (!pa) {
-                  v11_patch_error = 2;
-                  return false;
+              if (!pa || (pa & 3u)) {
+                  v111_hook_status = 3;
+                  return;
               }
 
-              volatile u32 *physical_word =
+              volatile u32 *p =
                   (volatile u32 *)(
                       pa | 0x80000000u
                   );
 
-              *physical_word = enable
-                  ? V11_STICK_UP
-                  : V11_STICK_ORIGINAL;
+              // Installed at startup, before
+              // normal gameplay begins.
+              p[1] = dest;
+              p[0] = V111_JUMP;
 
               svcInvalidateEntireInstructionCache();
 
-              v11_patch_active = enable;
-              return true;
-          }
-          '''
-
-          d += '\nbool rowlet_v11_inject(u32 bits);\n'
-          d += 'bool rowlet_v11_set_up(bool enable);\n'
-          d += 'u32 rowlet_v11_error(void);\n'
-
-          controller = r'''
-          // V11 dry-run state machine.
-          //
-          // 0 = READY
-          // 1 = RELEASE
-          // 2 = PATCH UP
-          // 3 = PRESS A
-          // 4 = DONE
-          // 5 = STOP/ERROR
-
-          static unsigned v11_state = 0;
-          static unsigned v11_frames = 0;
-          static unsigned v11_idle = 0;
-          static unsigned v11_step_frames = 0;
-          static unsigned v11_a_calls = 0;
-          static unsigned v11_error = 0;
-
-          #define V11_TITLE 0x00040000001B5000ULL
-
-          static void v11_set(unsigned state)
-          {
-              v11_state = state;
-              v11_frames = 0;
+              v111_hook_status = 1;
           }
 
-          static void v11_stop(unsigned reason)
-          {
-              if (!rowlet_v11_set_up(false))
-                  v11_error = 3;
-              else
-                  v11_error = reason;
+          // 0 READY
+          // 1 RELEASE
+          // 2 IDLE
+          // 3 STEP NOW
+          // 4 DONE
+          // 5 STOPPED
 
-              v11_set(5);
-          }
+          static unsigned v111_phase = 0;
+          static unsigned v111_frames = 0;
+          static unsigned v111_release = 0;
 
-          static void rowlet_v11_tick(void)
+          static u32 v111_begin = 0;
+          static u32 v111_walk_begin = 0;
+          static u32 v111_idle = 0;
+          static u32 v111_walk = 0;
+
+          static void v111_tick(void)
           {
-              if (get_title_id() != V11_TITLE)
+              if (
+                  get_title_id() != V111_TITLE ||
+                  v111_hook_status != 1
+              )
                   return;
 
-              const u32 keys = get_current_keys();
+              u32 keys = get_current_keys();
 
-              // Start with L + R + Y.
-              // Never use X.
-              const u32 start =
+              // No X-button trigger.
+              const u32 trigger =
                   KEY_L | KEY_R | KEY_Y;
 
-              if (v11_state == 0) {
-                  if ((keys & start) == start &&
-                      !(keys & KEY_X))
-                  {
-                      v11_step_frames = 0;
-                      v11_a_calls = 0;
-                      v11_idle = 0;
-                      v11_error = 0;
-                      v11_set(1);
+              if (v111_phase == 0) {
+                  if (
+                      (keys & trigger) == trigger &&
+                      !(keys & KEY_X)
+                  ) {
+                      v111_release = 0;
+                      v111_frames = 0;
+                      v111_idle = 0;
+                      v111_walk = 0;
+                      v111_phase = 1;
                   }
 
                   return;
               }
 
-              // Physical B stops the test.
               if (keys & KEY_B) {
-                  v11_stop(4);
+                  v111_phase = 5;
                   return;
               }
 
-              if (v11_state >= 4)
-                  return;
-
-              if (v11_state == 1) {
-                  // Wait for activation buttons
-                  // to be fully released.
-                  v11_idle =
+              if (v111_phase == 1) {
+                  v111_release =
                       keys == 0
-                      ? v11_idle + 1
+                      ? v111_release + 1
                       : 0;
 
-                  if (v11_idle >= 15)
-                      v11_set(2);
+                  if (++v111_frames >= 600) {
+                      v111_phase = 5;
+                      return;
+                  }
 
-                  if (++v11_frames > 600)
-                      v11_stop(5);
+                  if (v111_release >= 15) {
+                      v111_begin = v111_hits;
+                      v111_frames = 0;
+                      v111_phase = 2;
+                  }
 
                   return;
               }
 
-              // Stop if unexpected keys are held.
-              if ((keys & ~(KEY_A | KEY_DUP)) != 0) {
-                  v11_stop(6);
+              if (v111_phase == 2) {
+                  // Count calls while standing still.
+                  v111_idle =
+                      v111_hits - v111_begin;
+
+                  if (++v111_frames >= 180) {
+                      v111_walk_begin = v111_hits;
+                      v111_frames = 0;
+                      v111_phase = 3;
+                  }
+
                   return;
               }
 
-              if (v11_state == 2) {
-                  // Apply the game-side Up patch once.
-                  if (v11_frames == 0) {
-                      if (!rowlet_v11_set_up(true)) {
-                          v11_stop(1);
-                          return;
-                      }
-                  }
+              if (v111_phase == 3) {
+                  // Count calls during physical Up.
+                  v111_walk =
+                      v111_hits - v111_walk_begin;
 
-                  // Remain patched for at most
-                  // 45 rendered frames.
-                  if (v11_frames < 45) {
-                      ++v11_step_frames;
-                  } else {
-                      // Restore the original instruction
-                      // before sending any A presses.
-                      if (!rowlet_v11_set_up(false)) {
-                          v11_stop(3);
-                          return;
-                      }
-
-                      v11_set(3);
-                      return;
-                  }
+                  if (++v111_frames >= 180)
+                      v111_phase = 4;
               }
-
-              else if (v11_state == 3) {
-                  // Preserve known A input method.
-                  // Ten short pulses.
-                  if (v11_frames < 350) {
-                      if ((v11_frames % 35) < 6) {
-                          if (!rowlet_v11_inject(KEY_A)) {
-                              v11_stop(7);
-                              return;
-                          }
-
-                          ++v11_a_calls;
-                      }
-                  } else {
-                      v11_set(4);
-                      return;
-                  }
-              }
-
-              ++v11_frames;
           }
 
-          static void rowlet_v11_overlay(void)
+          static void v111_overlay(void)
           {
-              if (get_title_id() != V11_TITLE)
+              if (get_title_id() != V111_TITLE)
                   return;
 
-              const char *state = "READY";
+              const char *phase = "READY";
 
-              if (v11_state == 1)
-                  state = "RELEASE";
+              if (v111_hook_status == 0)
+                  phase = "NOT READY";
 
-              if (v11_state == 2)
-                  state = "PATCH UP";
+              if (v111_hook_status == 2)
+                  phase = "ERR: OPCODE";
 
-              if (v11_state == 3)
-                  state = "PRESS A";
+              if (v111_hook_status == 3)
+                  phase = "ERR: ADDRESS";
 
-              if (v11_state == 4)
-                  state = "DONE";
+              if (v111_hook_status == 4)
+                  phase = "ERR: ALIGN";
 
-              if (v11_state == 5)
-                  state = "STOP/ERROR";
+              if (v111_hook_status == 1) {
+                  if (v111_phase == 1)
+                      phase = "RELEASE";
 
-              char buf[64];
+                  if (v111_phase == 2)
+                      phase = "IDLE";
+
+                  if (v111_phase == 3)
+                      phase = "STEP NOW";
+
+                  if (v111_phase == 4)
+                      phase = "DONE";
+
+                  if (v111_phase == 5)
+                      phase = "STOPPED";
+              }
+
+              char buf[48];
 
               host_print(
-                  (u32)"ROWLET V11 DRY",
-                  14,
+                  (u32)"V11.1 STICK TRACE",
+                  17,
                   0x00ffff
               );
 
@@ -347,8 +252,8 @@ jobs:
               snprintf(
                   buf,
                   sizeof(buf),
-                  "STATE: %s",
-                  state
+                  "STATE:%s",
+                  phase
               );
 
               host_print(
@@ -357,23 +262,13 @@ jobs:
                   0x00ffff
               );
 
-              if (v11_state == 5) {
-                  snprintf(
-                      buf,
-                      sizeof(buf),
-                      "ERR:%u/%u",
-                      v11_error,
-                      rowlet_v11_error()
-                  );
-              } else {
-                  snprintf(
-                      buf,
-                      sizeof(buf),
-                      "STEP:%u A:%u",
-                      v11_step_frames,
-                      v11_a_calls
-                  );
-              }
+              snprintf(
+                  buf,
+                  sizeof(buf),
+                  "ID:%lu MV:%lu",
+                  (unsigned long)v111_idle,
+                  (unsigned long)v111_walk
+              );
 
               host_print(
                   (u32)buf,
@@ -383,63 +278,67 @@ jobs:
           }
           '''
 
-          m = once(
-              m,
-              'void run_hook(',
-              controller + '\nvoid run_hook(',
-              'controller location'
-          )
+          needle = 'void run_hook('
 
-          # Replace the earlier V6 controller loop.
-          # Place V11 status on the main popup.
-          hook_start = (
-              '        scan_input();\n'
-              '        rowlet_a_test_tick();\n'
-              '        run_frame();'
-          )
-
-          hook_end = (
-              '        draw_to_screen('
-              'screenId, fb_a, stride, format);'
-          )
-
-          if (
-              m.count(hook_start) != 1
-              or m.count(hook_end) != 1
-          ):
+          if s.count(needle) != 1:
               raise RuntimeError(
-                  'V6 overlay hook not found'
+                  'V11.1 run_hook insertion point missing'
               )
 
-          a = m.index(hook_start)
-          b = (
-              m.index(hook_end, a)
-              + len(hook_end)
+          s = s.replace(
+              needle,
+              observer + '\n' + needle,
+              1
           )
 
-          m = (
-              m[:a]
-              + '        scan_input();\n'
-              + '        rowlet_v11_tick();\n'
-              + '        run_frame();\n'
-              + '        rowlet_v11_overlay();\n'
-              + hook_end
-              + m[b:]
+          old = (
+              '        scan_input();\n'
+              '        run_frame();\n'
+              '        draw_to_screen(screenId, fb_a, stride, format);'
           )
 
-          main.write_text(m)
-          hid.write_text(h)
-          header.write_text(d)
+          new = (
+              '        scan_input();\n'
+              '        v111_tick();\n'
+              '        run_frame();\n'
+              '        v111_overlay();\n'
+              '        draw_to_screen(screenId, fb_a, stride, format);'
+          )
 
-          print('V11 game-side movement test patched')
-          print('Trigger: L + R + Y')
-          print('Mode: DRY RUN')
-          print('Soft resets: DISABLED')
+          if s.count(old) != 1:
+              raise RuntimeError(
+                  'V11.1 framebuffer hook not found'
+              )
+
+          s = s.replace(old, new, 1)
+
+          old = (
+              '    initialize();\n'
+              '    svcInvalidateEntireInstructionCache();'
+          )
+
+          new = (
+              '    initialize();\n'
+              '    v111_install();\n'
+              '    svcInvalidateEntireInstructionCache();'
+          )
+
+          if s.count(old) != 1:
+              raise RuntimeError(
+                  'V11.1 startup hook not found'
+              )
+
+          s = s.replace(old, new, 1)
+
+          main.write_text(s)
+
+          print("V11.1 diagnostic installed")
+          print("No automatic inputs or resets")
           PY
 
-          python3 /tmp/v11.py
+          python3 /tmp/v111.py
 
-      - name: Fix libctru 2.4.1 compatibility
+      - name: Fix libctru compatibility
         shell: bash
         run: |
           python3 - <<'PY'
@@ -449,15 +348,17 @@ jobs:
           code = ld.read_text()
 
           if '__tdata_align' not in code:
-              needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
+              needle = (
+                  'SORT(CONSTRUCTORS)\n'
+                  '\t\t. = ALIGN(4);'
+              )
               assert needle in code
-
               code = code.replace(
                   needle,
-                  needle
-                  + '\n\t\t__tdata_align = .;'
-                  + '\n\t\tLONG (ALIGNOF(.tdata));'
-                  + '\n\t\t. = ALIGN(4);',
+                  needle +
+                  '\n\t\t__tdata_align = .;'
+                  '\n\t\tLONG (ALIGNOF(.tdata));'
+                  '\n\t\t. = ALIGN(4);',
                   1
               )
 
@@ -473,8 +374,7 @@ jobs:
                   'ABSOLUTE(. - 8), '
                   'MAX(4, ALIGNOF(.tdata))));\n'
                   '\t\t__tls_start = .;\n'
-                  '\t\t. += SIZEOF(.tdata) + '
-                  'SIZEOF(.tbss);',
+                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
                   1
               )
 
@@ -484,24 +384,27 @@ jobs:
           code = src.read_text()
 
           if (
-              '__system_runflags' not in code
-              or '__apt_appid' not in code
+              '__system_runflags' not in code or
+              '__apt_appid' not in code
           ):
-              needle = 'u32 __ctru_linear_heap_size = 0;'
+              needle = (
+                  'u32 __ctru_linear_heap_size = 0;'
+              )
+
               assert needle in code
 
               code = code.replace(
                   needle,
-                  needle
-                  + '\n\nu32 __system_runflags = 0;'
-                  + '\nu32 __apt_appid = 0;',
+                  needle +
+                  '\n\nu32 __system_runflags = 0;'
+                  '\nu32 __apt_appid = 0;',
                   1
               )
 
           src.write_text(code)
           PY
 
-      - name: Compile with log
+      - name: Compile and save log
         shell: bash
         run: |
           set -o pipefail
@@ -509,13 +412,13 @@ jobs:
             -v "$PWD:/work" \
             -w /work \
             zaksabeast/devkitarm-rust make \
-            2>&1 | tee v11_compile.log
+            2>&1 | tee v111_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v11-game-side-dry-test
+          name: rowlet-v11-1-stick-trace
           path: out/default.3gx
           if-no-files-found: error
 
@@ -523,6 +426,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v11-compile-log
-          path: v11_compile.log
+          name: rowlet-v11-1-compile-log
+          path: v111_compile.log
           if-no-files-found: warn
