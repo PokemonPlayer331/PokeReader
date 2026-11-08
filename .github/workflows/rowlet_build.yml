@@ -1,6 +1,5 @@
-
-# V12.1: A-only Rowlet starter test
-name: Build Rowlet V12.1 A Spam Shiny Check
+# V13.1: verified non-shiny-only reset loop; A repeats across game resets.
+name: Build Rowlet V13.1 Auto-Reset Loop
 
 'on':
   workflow_dispatch:
@@ -44,6 +43,7 @@ jobs:
                   raise SystemExit(f'V12.1 {label}: expected one anchor, found {n}; stopped before editing')
               return s.replace(a,b,1)
 
+          # V6 controller really starts with exactly this marker in apply_input_test.py.
           start = '// ROWLET_V6_INPUT_TEST\n\nstatic unsigned int rowlet_a_test_state'
           end = 'void run_hook('
           if m.count(start) != 1 or m.count(end) != 1:
@@ -56,7 +56,7 @@ jobs:
           #define ROWLET_V12_TITLE 0x00040000001B5000ULL
           #define ROWLET_V12_TIMEOUT 10800u
           static volatile u32 v12_phase = 0;
-          static u32 v12_state = 0;
+          static u32 v12_state = 0; /* 0 ready, 1 release trigger, 2 pulses, 3 stop */
           static u32 v12_frame = 0;
           static u32 v12_release = 0;
 
@@ -98,6 +98,7 @@ jobs:
                   v12_state = 3;
                   return;
               }
+              /* Two ON frames, four OFF frames; ~10 distinct A presses/second. */
               bool ok = ((v12_frame % 6u) < 2u) ?
                   rowlet_try_inject_a_frame() : rowlet_try_release_a_frame();
               if (!ok) v12_state = 3;
@@ -106,6 +107,8 @@ jobs:
           '''
           m = m[:a] + controller + m[b:]
 
+          # Patch the actual V6 hook block. The V6 patcher uses a multiline display
+          # whose formatting differs from the older v12 template. Restrict to run_hook.
           run = m.index('void run_hook(')
           start_block = m.index('        scan_input();\n        rowlet_a_test_tick();\n        run_frame();',run)
           end_statement = '        draw_to_screen(screenId, fb_a, stride, format);'
@@ -118,6 +121,8 @@ jobs:
                   rowlet_v12_tick();
                   draw_to_screen(screenId, fb_a, stride, format);'''+m[end_block:]
 
+          # Explicitly clear injected A between pulses, so the game sees new key edges.
+          # Same mapping and checks as the working V6 injection helper.
           release = r'''
           // ROWLET_V12_1: release the virtual A in the current HID sample.
           bool rowlet_try_release_a_frame(void)
@@ -145,6 +150,8 @@ jobs:
               raise SystemExit('V12.1 V6 HID header missing; stopped before editing')
           d += '\n// ROWLET_V12_1\nbool rowlet_try_release_a_frame(void);\n'
 
+          # V5 watcher always ticks, even when overlay is hidden. Report its phase
+          # immediately after that tick, so we never show a guessed shiny value.
           f = rep(f, 'use super::rowlet_watch::{Sample, Watch};',
                   'use super::rowlet_watch::{Sample, Watch, Phase};','Rust phase import')
           status = '''    if is_ultra_sun {
@@ -171,14 +178,245 @@ jobs:
               }
 
           '''
+          # Watcher original insertion comes directly from patch/apply_patch.py.
           watcher_end = '            shiny: mon.is_shiny(),\n        });\n    }\n\n'
           f = rep(f, watcher_end, watcher_end+status, 'Rust V5 watcher tick')
 
+          # Write only when all checks above succeeded.
           for p, value in ((main,m),(hid,h),(hdr,d),(frame,f)):
               p.write_text(value)
           print('V12.1 installed from V5 + V6, one-line shiny status, distinct A pulses.')
           PY
           python3 /tmp/rowlet_v12_1_patch.py
+
+      - name: Install V13.1 reset loop
+        shell: bash
+        run: |
+          cat > /tmp/rowlet_v13_addon.py <<'PY'
+          #!/usr/bin/env python3
+          """Apply a V13.1 auto-reset loop to a clean V12.1-patched checkout.
+          No reset without the existing decoded, stable, validated Rowlet Watch Normal phase.
+          """
+          from pathlib import Path
+
+          main=Path('3gx/sources/main.c')
+          hid=Path('3gx/sources/hid.c')
+          hdr=Path('3gx/includes/hid.h')
+          frame=Path('reader_core/src/gen7/frame.rs')
+          paths=(main,hid,hdr,frame)
+          m,h,d,f=(p.read_text() for p in paths)
+
+          def repl(s,a,b,label):
+              n=s.count(a)
+              if n!=1:
+                  raise SystemExit(f'V13 {label}: expected one exact anchor; found {n}; no changes written')
+              return s.replace(a,b,1)
+
+          start='// ROWLET_V12_1: virtual A only; no injected motion, no reset.'
+          end='void run_hook('
+          if m.count(start)!=1 or m.count(end)!=1 or m.index(start)>=m.index(end):
+              raise SystemExit('V13 expected V12.1 controller missing; no changes written')
+          a,b=m.index(start),m.index(end)
+          ctrl=r'''// ROWLET_V13: experimental A-spam / nonshiny-only reset loop.
+          #define ROWLET_V13_TITLE 0x00040000001B5000ULL
+          /* No injected movement; reset is L+R+START, never X. */
+          static volatile u32 v13_phase = 0; // V5 verified phase reported by Rust
+          static u32 v13_mode = 0; // 0 ready 1 trigger-release 2 A 3 reset 4 reload 5 stop
+          static u32 v13_frame = 0;
+          static u32 v13_released = 0;
+          static u32 v13_boot_frames = 0;
+          static u32 v13_resets = 0;
+          static u32 v13_missing_hid = 0;
+          static u32 v13_reset_ok_frames = 0;
+
+          void rowlet_v13_report(u32 phase) { v13_phase = phase; }
+          u32 rowlet_v13_reset_sent(void) { return v13_mode == 4 ? 1u : 0u; }
+
+          static void rowlet_v13_halt(void)
+          {
+              rowlet_try_release_a_frame();
+              rowlet_try_soft_reset_frame(false);
+              v13_mode = 5;
+          }
+
+          static void rowlet_v13_a_pulse(void)
+          {
+              bool down = (v13_frame % 6u) < 2u; // ~10 A taps / second
+              bool ok = down ? rowlet_try_inject_a_frame() : rowlet_try_release_a_frame();
+              // During title/reload HID may temporarily be unavailable; retry for 10 sec.
+              if (!ok) {
+                  if (++v13_missing_hid > 600) rowlet_v13_halt();
+              } else {
+                  v13_missing_hid = 0;
+              }
+              v13_frame++;
+          }
+
+          static void rowlet_v13_tick(void)
+          {
+              if (get_title_id() != ROWLET_V13_TITLE) return;
+              const u32 keys = get_current_keys();
+              const u32 trigger = KEY_L | KEY_R | KEY_Y; // X is NEVER injected
+
+              if (keys & KEY_B) { rowlet_v13_halt(); return; }
+              if (v13_mode == 5) return;
+              if (v13_phase == 5 || v13_phase == 6) { // SHINY or ERROR
+                  rowlet_v13_halt();
+                  return;
+              }
+
+              if (v13_mode == 0) {
+                  // Start manually with L+R+Y or auto-start after boot/reload.
+                  // Auto-start is needed if an in-game reset recreates the plugin process.
+                  if ((keys & trigger) == trigger) {
+                      v13_mode = 1; v13_released = 0; v13_frame = 0;
+                  } else if (++v13_boot_frames > 240) { // initial ~4 sec grace period
+                      v13_mode = 2; v13_frame = 0;
+                  }
+                  return;
+              }
+              if (v13_mode == 1) {
+                  if ((keys & trigger) == 0) {
+                      if (++v13_released >= 8) { v13_mode = 2; v13_frame = 0; }
+                  } else {
+                      v13_released = 0;
+                  }
+                  if (++v13_frame > 600) rowlet_v13_halt();
+                  return;
+              }
+              if (v13_mode == 2) {
+                  // This is the ONLY condition that authorizes a reset:
+                  // V5 Rowlet Watch confirmed stable valid NON-SHINY Rowlet (phase 4).
+                  if (v13_phase == 4) {
+                      rowlet_try_release_a_frame();
+                      v13_mode = 3; v13_frame = 0;
+                      v13_missing_hid = 0; v13_reset_ok_frames = 0;
+                      return;
+                  }
+                  if (v13_frame > (60u * 240u)) { // 4-minute encounter timeout
+                      rowlet_v13_halt();
+                      return;
+                  }
+                  rowlet_v13_a_pulse();
+                  return;
+              }
+              if (v13_mode == 3) {
+                  // Never press A while attempting a reset.
+                  rowlet_try_release_a_frame();
+                  bool ok = rowlet_try_soft_reset_frame(true);
+                  v13_frame++;
+                  // HID pointer can disappear while the game reloads.
+                  // Only treat a disappearing pointer as a possible reload if
+                  // we actually injected the chord for at least 8 frames.
+                  if (ok) v13_reset_ok_frames++;
+                  if (!ok && v13_reset_ok_frames < 8u) {
+                      rowlet_v13_halt();
+                      return;
+                  }
+                  if (v13_frame >= 28u || (!ok && v13_reset_ok_frames >= 8u)) {
+                      rowlet_try_soft_reset_frame(false);
+                      v13_mode = 4; v13_frame = 0; v13_missing_hid = 0;
+                      v13_resets++;
+                  }
+                  return;
+              }
+              if (v13_mode == 4) {
+                  // Never reset twice without an entirely new empty-slot -> Rowlet cycle.
+                  // Rust re-arms the watcher only after verified post-reset empty slot 1.
+                  if (v13_phase == 1 || v13_phase == 2 || v13_phase == 3) {
+                      v13_mode = 2; v13_frame = 0;
+                      v13_missing_hid = 0;
+                  } else if (v13_frame > (60u * 100u)) { // reload failed; no more resets
+                      rowlet_v13_halt();
+                      return;
+                  }
+                  rowlet_try_soft_reset_frame(false);
+                  rowlet_v13_a_pulse();
+                  return;
+              }
+          }
+
+          '''
+          m=m[:a]+ctrl+m[b:]
+          m=repl(m,'        rowlet_v12_tick();','        rowlet_v13_tick();','C hook entry')
+
+          # Shared HID bridge inherits V6 validated addressing; only new operation is key mask.
+          helper=r'''
+          // ROWLET_V13: apply/release Ultra Sun's L+R+START soft reset chord.
+          // Never write X and never press the combination unless the C state machine
+          // received the verified Phase::Normal from Rowlet Watch.
+          bool rowlet_try_soft_reset_frame(bool down)
+          {
+              if (!g_key_addr) return false;
+              volatile u32 *base = g_key_addr - (0x28 / 4);
+              u32 index = base[0x10 / 4];
+              if (index >= 8) return false;
+              volatile u32 *sample = base + (0x28 / 4) + index * (0x10 / 4);
+              u32 sample_pa = svcConvertVAToPA((const void *)sample, false);
+              u32 current_pa = svcConvertVAToPA((const void *)(base + (0x1c / 4)), false);
+              if (!sample_pa || !current_pa) return false;
+              volatile u32 *s = (volatile u32 *)(sample_pa | 0x80000000u);
+              volatile u32 *cur = (volatile u32 *)(current_pa | 0x80000000u);
+              const u32 mask = KEY_L | KEY_R | KEY_START;
+              if (down) {
+                  s[0] = (s[0] & ~KEY_A) | mask;
+                  s[1] = (s[1] & ~KEY_A) | mask;
+                  *cur = (*cur & ~KEY_A) | mask;
+              } else {
+                  s[0] &= ~mask;
+                  s[1] &= ~mask;
+                  *cur &= ~mask;
+              }
+              return true;
+          }
+          '''
+          if h.count('bool rowlet_try_release_a_frame(void)') != 1:
+              raise SystemExit('V13 expects working V12.1 A release bridge')
+          h+=helper
+          d+='\n// ROWLET_V13\nbool rowlet_try_soft_reset_frame(bool down);\n'
+
+          # Re-arm only AFTER C has sent reset, and the trainer TSV + slot-one-empty
+          # observations are stable for 90 consecutive frames. At other times V5's
+          # fail-closed Normal/Shiny/Error latches are preserved.
+          f=repl(f,'    rowlet_watch: Watch,','    rowlet_watch: Watch,\n    rowlet_v13_rearm_frames: u16,','rearm field')
+          f=repl(f,'        rowlet_watch: Watch::new(),','        rowlet_watch: Watch::new(),\n        rowlet_v13_rearm_frames: 0,','rearm initialization')
+          f=repl(f,'extern "C" { fn rowlet_v12_report(phase: u32); }',
+                 'extern "C" { fn rowlet_v13_report(phase: u32); }',
+                 'Rust FFI declaration')
+          f=repl(f,'unsafe { rowlet_v12_report(phase); }','unsafe { rowlet_v13_report(phase); }','Rust FFI report')
+          needle='''    if is_ultra_sun {
+                  let phase = match state.rowlet_watch.phase {'''
+          replacement='''    if is_ultra_sun {
+                  // V5's earlier watcher block had its own local 'mon'. Read
+                  // a fresh slot-one record here: the earlier binding is out
+                  // of scope, and the build must not refer to it.
+                  let mon = reader.party_pkm(0);
+                  // Re-arm ONLY after this plugin has issued the reset chord and
+                  // we've seen a stable original-save trainer ID with empty slot 1.
+                  extern "C" { fn rowlet_v13_reset_sent() -> u32; }
+                  if state.rowlet_watch.phase == Phase::Normal &&
+                     unsafe { rowlet_v13_reset_sent() } != 0 {
+                      if reader.tsv() == super::rowlet_watch::TSV && mon.species() == 0 {
+                          state.rowlet_v13_rearm_frames = state.rowlet_v13_rearm_frames.saturating_add(1);
+                          if state.rowlet_v13_rearm_frames >= 90 {
+                              state.rowlet_watch = Watch::new();
+                              state.rowlet_v13_rearm_frames = 0;
+                          }
+                      } else {
+                          state.rowlet_v13_rearm_frames = 0;
+                      }
+                  }
+                  let phase = match state.rowlet_watch.phase {'''
+          f=repl(f,needle,replacement,'Rust guarded re-arm logic')
+          # After the old latch clears, C will see Phase::Standby 0; only then re-arm in
+          # Rust's existing V5 watcher, requiring another 30 stable empty frames.
+
+          # Avoid introducing report display complexity; label remains one Rowlet line.
+          for p,value in zip(paths,(m,h,d,f)):
+              p.write_text(value)
+          print('V13.1 installed: auto A, non-shiny-only L+R+START reset, 90-frame rearm guard.')
+          PY
+          python3 /tmp/rowlet_v13_addon.py
 
       - name: Fix toolchain linker compatibility
         shell: bash
@@ -214,10 +452,12 @@ jobs:
       - name: Verify installed code
         shell: bash
         run: |
-          grep -Fq 'rowlet_v12_tick();' 3gx/sources/main.c
-          grep -Fq 'rowlet_try_release_a_frame' 3gx/sources/hid.c
+          grep -Fq 'rowlet_v13_tick();' 3gx/sources/main.c
+          grep -Fq 'rowlet_try_soft_reset_frame' 3gx/sources/hid.c
           grep -Fq 'ROWLET: SHINY!' reader_core/src/gen7/frame.rs
           grep -Fq 'ROWLET: NOT SHINY' reader_core/src/gen7/frame.rs
+          grep -Fq 'rowlet_v13_reset_sent' reader_core/src/gen7/frame.rs
+          grep -Fq 'let mon = reader.party_pkm(0);' reader_core/src/gen7/frame.rs
           if grep -Fq 'rowlet_a_test_tick();' 3gx/sources/main.c; then
             echo 'Old V6 hook survived' >&2
             exit 1
@@ -228,13 +468,13 @@ jobs:
         run: |
           set -o pipefail
           docker run --rm -v "$PWD:/work" -w /work \
-            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v12_1_compile.log
+            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v13_1_compile.log
 
       - name: Upload 3GX
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v12-1-a-spam-shiny
+          name: rowlet-v13-1-auto-reset
           path: out/default.3gx
           if-no-files-found: error
 
@@ -242,6 +482,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v12-1-compile-log
-          path: rowlet_v12_1_compile.log
+          name: rowlet-v13-1-compile-log
+          path: rowlet_v13_1_compile.log
           if-no-files-found: warn
