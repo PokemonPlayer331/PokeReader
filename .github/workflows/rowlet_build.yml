@@ -1,5 +1,5 @@
 
-name: Build Rowlet Watch V8.5 Raw Circle Pad Test
+name: Build Rowlet Watch V8.6 Movement Probe
 
 on: [push, workflow_dispatch]
 
@@ -10,19 +10,19 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out project
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Apply V5 detector
         run: python3 patch/apply_patch.py .
 
-      - name: Apply V6 virtual A
+      - name: Apply V6 A input
         run: python3 patch/apply_input_test.py .
 
-      - name: Apply V7.1 reset control
+      - name: Apply V7 reset test
         run: python3 patch/apply_reset_test.py .
 
-      - name: Apply V8.3 resumable controller
+      - name: Apply V8.3 controller
         run: python3 patch/apply_v8_3.py .
 
       - name: Fix raw Circle Pad state in V8.5
@@ -35,8 +35,7 @@ jobs:
           text = path.read_text()
 
           old = 's[3] = (u32)(125u << 16);'
-          new = '''// Update current and sampled Circle Pad
-                  u32 raw_pa = svcConvertVAToPA(
+          new = '''u32 raw_pa = svcConvertVAToPA(
                       (const void *)(base + (0x20 / 4)), false);
                   if (!raw_pa) return false;
                   volatile u32 *raw =
@@ -48,25 +47,95 @@ jobs:
                   s[1] |= KEY_CPAD_UP;'''
 
           if text.count(old) != 1:
-              raise SystemExit('Circle Pad code not found')
+              raise SystemExit('Movement anchor missing')
           path.write_text(text.replace(old, new, 1))
 
           main = Path('3gx/sources/main.c')
           m = main.read_text()
           anchor = 'if (v8_state == 4 || v8_state == 7) expected_virtual = KEY_A;'
-          replacement = (
-              anchor + '\n    if (v8_state == 3) '
-              'expected_virtual = KEY_CPAD_UP;'
-          )
-
+          replacement = (anchor + '\n    if (v8_state == 3) '
+                         'expected_virtual = KEY_CPAD_UP;')
           if m.count(anchor) != 1:
-              raise SystemExit('Input guard not found')
+              raise SystemExit('Input guard missing')
           main.write_text(m.replace(anchor, replacement, 1))
-
-          print('V8.5 movement fix applied')
           PY
 
-      - name: Compile plugin
+      - name: Add movement diagnostic
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          hpath = Path('3gx/sources/hid.c')
+          dpath = Path('3gx/includes/hid.h')
+          mpath = Path('3gx/sources/main.c')
+          h = hpath.read_text()
+          d = dpath.read_text()
+          m = mpath.read_text()
+
+          # No automatic hunting resets during this test.
+          old = '#define V8_MAX_RESETS 2u'
+          if m.count(old) != 1:
+              raise SystemExit('Reset limit anchor missing')
+          m = m.replace(old, '#define V8_MAX_RESETS 0u', 1)
+
+          h += '''
+          // ROWLET_V86_PROBE
+          int rowlet_v86_sample_y(void)
+          {
+              if (!g_key_addr) return -999;
+              volatile u32 *base = g_key_addr - (0x28 / 4);
+              u32 index = base[0x10 / 4];
+              if (index >= 8) return -998;
+              volatile u32 *sample =
+                  base + (0x28 / 4) + index * 4;
+              return (s16)(sample[3] >> 16);
+          }
+          '''
+
+          d += '''
+          int rowlet_v86_sample_y(void);
+          '''
+
+          anchor = '        // ROWLET_V8_INTEGRATED\n        rowlet_v8_tick();'
+          replacement = '''        v86_pre_y = rowlet_v86_sample_y();
+                  rowlet_v8_tick();
+                  v86_post_y = rowlet_v86_sample_y();'''
+          if m.count(anchor) != 1:
+              raise SystemExit('Frame hook missing')
+          m = m.replace(anchor, replacement, 1)
+
+          declaration = '''static int v86_pre_y = -999;
+          static int v86_post_y = -999;
+          '''
+          if m.count('void run_hook(') != 1:
+              raise SystemExit('Run hook missing')
+          m = m.replace(
+              'void run_hook(',
+              declaration + 'void run_hook(',
+              1
+          )
+
+          anchor = '        rowlet_v8_overlay();'
+          replacement = '''        rowlet_v8_overlay();
+                  if (get_title_id() == 0x00040000001B5000ULL) {
+                      char diag[96];
+                      snprintf(diag, sizeof(diag),
+                          "V8.6 PAD Y BEFORE:%d AFTER:%d",
+                          v86_pre_y, v86_post_y);
+                      host_print((u32)diag, strlen(diag), 0x00FFFF);
+                  }'''
+          if m.count(anchor) != 1:
+              raise SystemExit('Overlay anchor missing')
+          m = m.replace(anchor, replacement, 1)
+
+          hpath.write_text(h)
+          dpath.write_text(d)
+          mpath.write_text(m)
+          print('Movement diagnostic installed; auto resets disabled')
+          PY
+
+      - name: Compile
         run: |
           docker run --rm \
             -v "$PWD:/work" \
@@ -76,6 +145,6 @@ jobs:
       - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-watch-v8-5-plugin
+          name: rowlet-watch-v8-6-probe
           path: out/default.3gx
           if-no-files-found: error
