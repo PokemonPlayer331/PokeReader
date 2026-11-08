@@ -1,6 +1,12 @@
-name: Rowlet V9.0 Fast Circle Pad Movement Test
 
-on: [push, workflow_dispatch]
+# Rowlet V12: fast A pulses + verified V5 shiny status (no resets)
+# For the existing PokemonPlayer331/PokeReader repo.
+# Hold the Circle Pad up physically; start with L+R+Y; B stops.
+# NO injected movement or reset buttons.
+name: Build Rowlet V12 A Spam Shiny Check
+
+'on':
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -9,235 +15,240 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out clean PokeReader source
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Apply proven V5 Rowlet detector
+      - name: Apply existing Rowlet Watch V5
         run: python3 patch/apply_patch.py .
 
-      - name: Apply V6 virtual A input
+      - name: Apply working V6 virtual A bridge
         run: python3 patch/apply_input_test.py .
 
-      - name: Apply V7.1 virtual reset test base
-        run: python3 patch/apply_reset_test.py .
+      - name: Install V12 A pulses and minimal shiny result
+        shell: bash
+        run: |
+          cat > /tmp/rowlet_v12_patch.py <<'PY'
+          #!/usr/bin/env python3
+          """V12 A-only + verified Rowlet Watch, minimal single-line overlay.
+          Apply to a clean checkout AFTER V5 and V6 patchers.
+          No movement injection. No reset injection. No automatic rearming.
+          """
+          from pathlib import Path
 
-      - name: Apply V8.3 controller base
-        run: python3 patch/apply_v8_3.py .
+          root = Path('.')
+          main = root / '3gx/sources/main.c'
+          hid = root / '3gx/sources/hid.c'
+          frame = root / 'reader_core/src/gen7/frame.rs'
+          for target in (main, hid, frame):
+              if not target.exists():
+                  raise RuntimeError(f'Missing {target}')
+          m, h, f = (main.read_text(), hid.read_text(), frame.read_text())
 
-      - name: Convert to V8.9 SAFE Rehid movement test
+          def repl(src, old, new, label):
+              found = src.count(old)
+              if found != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, found {found}')
+              return src.replace(old, new, 1)
+
+          # V10.7: compile-safe include for the already hardware-tested V6 A injection.
+          h = repl(h, '#include "common.h"',
+                   '#include "common.h"\n#include "csvc.h"', 'V6 HID include')
+
+          # Drop the entire V6 test controller (including its old X-key trigger).
+          start = '// ROWLET_V6_INPUT_TEST: manually triggered single-A experiment.'
+          end = 'void run_hook('
+          if m.count(start) != 1 or m.count(end) != 1:
+              raise RuntimeError('V6 controller anchor missing or ambiguous')
+          a = m.index(start)
+          b = m.index(end, a)
+
+          controller = r"""
+          // ROWLET_V12: only injects A; no analog movement or reset commands.
+          #define ROWLET_V12_TITLE 0x00040000001B5000ULL
+          #define ROWLET_V12_LIMIT (60u * 180u) // 3-min safety timeout, approx.
+          static volatile u32 rowlet_v12_phase = 0;  // reported by verified Rust watcher
+          static u32 rowlet_v12_state = 0; // 0 ready, 1 release, 2 A pulses, 3 stopped
+          static u32 rowlet_v12_frame = 0;
+          static u32 rowlet_v12_released = 0;
+
+          // Rust reports its validated Rowlet Watch phase; never guess from raw RAM.
+          void rowlet_v12_report(u32 phase) { rowlet_v12_phase = phase; }
+
+          static void rowlet_v12_tick(void)
+          {
+              if (get_title_id() != ROWLET_V12_TITLE) return;
+              const u32 keys = get_current_keys();
+              const u32 start = KEY_L | KEY_R | KEY_Y; // no X key
+
+              // Physical B always stops scripted presses. A shiny, non-shiny,
+              // or invalid/unknown record stops the script before further injections.
+              if (keys & KEY_B || rowlet_v12_phase == 4 ||
+                  rowlet_v12_phase == 5 || rowlet_v12_phase == 6) {
+                  rowlet_v12_state = 3;
+                  return;
+              }
+              if (rowlet_v12_state == 0) {
+                  if ((keys & start) == start) {
+                      rowlet_v12_frame = 0;
+                      rowlet_v12_released = 0;
+                      rowlet_v12_state = 1;
+                  }
+                  return;
+              }
+              if (rowlet_v12_state == 1) {
+                  // A held-up circle pad is allowed; only the activation buttons
+                  // must be released. Abort if the user never releases the chord.
+                  if (!(keys & start)) {
+                      if (++rowlet_v12_released >= 8) {
+                          rowlet_v12_state = 2;
+                          rowlet_v12_frame = 0;
+                      }
+                  } else {
+                      rowlet_v12_released = 0;
+                  }
+                  if (++rowlet_v12_frame > 600u) rowlet_v12_state = 3;
+                  return;
+              }
+              if (rowlet_v12_state != 2) return;
+              if (rowlet_v12_frame >= ROWLET_V12_LIMIT) {
+                  rowlet_v12_state = 3;
+                  return;
+              }
+              // 2 frames ON, 4 OFF = up to ~10 A pulses/sec at 60 FPS.
+              // The off frames let the game see new A press edges.
+              if ((rowlet_v12_frame % 6u) < 2u) {
+                  if (!rowlet_try_inject_a_frame()) {
+                      rowlet_v12_state = 3;
+                      return;
+                  }
+              }
+              rowlet_v12_frame++;
+          }
+          """
+          m = m[:a] + controller + '\n' + m[b:]
+
+          # Render detector text only: remove the original V6 diagnostic overlay.
+          v6_hook = """        scan_input();
+                  rowlet_a_test_tick();
+                  run_frame();
+                  if (get_title_id() == 0x00040000001B5000ULL)
+                  {
+                      const char *label = 0;
+                      if (rowlet_a_test_state == 0) label = "A TEST READY: L+X+Y";
+                      if (rowlet_a_test_state == 1) label = "A TEST: PULSING";
+                      if (rowlet_a_test_state == 2) label = "A TEST: ATTEMPTED";
+                      if (rowlet_a_test_state == 3) label = "A TEST: FAILED/CANCELLED";
+                      if (label) host_print((u32)label, strlen(label), 0x00ff00);
+                  }
+                  draw_to_screen(screenId, fb_a, stride, format);"""
+          v12_hook = """        scan_input();
+                  run_frame();
+                  rowlet_v12_tick();
+                  draw_to_screen(screenId, fb_a, stride, format);"""
+          m = repl(m, v6_hook, v12_hook, 'V6 render hook')
+
+          # V5's watcher already has decoded valid-mon/PID/shiny confirmation.
+          # Report that state to the C input driver, then return early to avoid the
+          # large original PokeReader menus and diagnostics on Ultra Sun.
+          f = repl(f, 'use super::rowlet_watch::{Sample, Watch};',
+                   'use super::rowlet_watch::{Sample, Watch, Phase};',
+                   'V5 Rust import')
+          status_hook = """    if is_ultra_sun {
+                  // V12: status is derived ONLY from the verified Rowlet Watch.
+                  let phase = match state.rowlet_watch.phase {
+                      Phase::Standby => 0,
+                      Phase::WaitRowlet => 1,
+                      Phase::Verify => 2,
+                      Phase::Reverify => 3,
+                      Phase::Normal => 4,
+                      Phase::Shiny => 5,
+                      Phase::Error => 6,
+                  };
+                  extern "C" { fn rowlet_v12_report(phase: u32); }
+                  unsafe { rowlet_v12_report(phase); }
+                  let text = match state.rowlet_watch.phase {
+                      Phase::Standby | Phase::WaitRowlet => "ROWLET: WAITING",
+                      Phase::Verify | Phase::Reverify => "ROWLET: CHECKING",
+                      Phase::Normal => "ROWLET: NOT SHINY",
+                      Phase::Shiny => "ROWLET: SHINY!",
+                      Phase::Error => "ROWLET: ERROR",
+                  };
+                  pnp::println!("{}", text);
+                  return;
+              }
+
+          """
+          # IMPORTANT: report AFTER V5's tick. An earlier V12 version returned
+          # before the watcher ran, leaving the status stuck at WAITING.
+          watcher_end = '            shiny: mon.is_shiny(),\n        });\n    }\n\n'
+          f = repl(f, watcher_end, watcher_end + status_hook,
+                   'V5 watcher completion')
+
+          # Commit source only after all source invariants are checked.
+          main.write_text(m)
+          hid.write_text(h)
+          frame.write_text(f)
+          print('V12 installed: A-only pulses; single Rowlet status line; no reset.')
+          PY
+          python3 /tmp/rowlet_v12_patch.py
+
+      - name: Fix libctru compatibility
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
-          path = Path('3gx/sources/main.c')
-          s = path.read_text()
-
-          def replace(old, new):
-              global s
-              count = s.count(old)
-              if count != 1:
-                  raise SystemExit(f'V8.9: expected 1 anchor, got {count}: {old[:85]!r}')
-              s = s.replace(old, new, 1)
-
-          # This is a real DIFFERENT movement test: inject D-pad Up as a
-          # virtual button, hoping Rehid maps it to Circle Pad Up.
-          replace('if (v8_frames < 28 && !rowlet_v8_inject(0, true)) {',
-                  'if (v8_frames < 28 && !rowlet_v8_inject(KEY_DUP, false)) {')
-
-          # Don't interpret an injected D-pad/CPAD flag as the user pressing
-          # a key and abort the experiment.
-          replace('if (v8_state == 6) expected_virtual = KEY_L | KEY_R | KEY_START;',
-                  'if (v8_state == 6) expected_virtual = KEY_L | KEY_R | KEY_START;\n'
-                  '    if (v8_state == 3) expected_virtual = KEY_DUP | KEY_CPAD_UP;')
-
-          # No D-pad on the trigger: Rehid already remaps D-pad Up.
-          replace('const u32 arm = KEY_L | KEY_DUP;',
-                  'const u32 arm = KEY_L | KEY_R | KEY_B;')
-          replace('const u32 stop = KEY_L | KEY_DDOWN;',
-                  'const u32 stop = KEY_L | KEY_R | KEY_Y;')
-
-          # Disable SD-session persistence: no automatic activation or resets.
-          # This deliberately ignores any marker from an older build.
-          def replace_span(begin, finish, new):
-              global s
-              if s.count(begin) != 1 or s.count(finish) != 1:
-                  raise SystemExit('V8.9: expected unique controller block anchors')
-              a = s.index(begin)
-              b = s.index(finish, a) + len(finish)
-              s = s[:a] + new + s[b:]
-
-          replace_span('    if (!v8_initialized) {',
-                       '\n    // Emergency stop',
-                       '    if (!v8_initialized) {\n'
-                       '        v8_initialized = true;\n'
-                       '        v8_fs_ready = false;\n'
-                       '    }\n\n    // Emergency stop')
-
-          replace_span('            if (!v8_write_session(V8_MAX_RESETS)) {',
-                       '            v8_remaining = V8_MAX_RESETS;',
-                       '            v8_remaining = 0;')
-          replace('        if (!v8_write_session(0)) v8_fs_error = 4;\n', '')
-
-          # Make the reset state an unconditional stop (defense in depth).
-          replace_span('    if (v8_state == 6) {',
-                       '\n}\n\nstatic void rowlet_v8_overlay',
-                       '    if (v8_state == 6) { v8_stop(8); return; }'
-                       '\n}\n\nstatic void rowlet_v8_overlay')
-          replace('#define V8_MAX_RESETS 2u', '#define V8_MAX_RESETS 0u')
-
-          # Unique overlay text: immediately proves this new plugin loaded.
-          replace('const char *status="OFF - L+UP";',
-                  'const char *status="OFF - L+R+B";')
-          replace('case 3: status="WALKING FORWARD";',
-                  'case 3: status="WALK VIA REHID";')
-          replace('"V8.3 %s | R:%lu P:%lu E:%u FS:%u"',
-                  '"V8.9 %s | R:%lu P:%lu E:%u FS:%u"')
-
-          path.write_text(s)
-          print('V8.9 installed: L+R+B start, L+R+Y stop, virtual D-pad movement.')
-          print('V8.9: session auto-resume OFF, ALL automatic soft resets OFF.')
+          ld = Path('3gx/3gx.ld')
+          s = ld.read_text()
+          if '__tdata_align' not in s:
+              needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
+              if needle not in s:
+                  raise RuntimeError('Linker __tdata_align anchor absent')
+              s = s.replace(needle,
+                            needle + '\n\t\t__tdata_align = .;\n\t\tLONG (ALIGNOF(.tdata));\n\t\t. = ALIGN(4);', 1)
+          needle = '\t\t__tls_start = .;\n\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
+          if needle in s:
+              s = s.replace(needle,
+                            '\t\t. = 8 + ABSOLUTE(ALIGN(ABSOLUTE(. - 8), MAX(4, ALIGNOF(.tdata))));\n'
+                            '\t\t__tls_start = .;\n\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);', 1)
+          ld.write_text(s)
+          p = Path('3gx/sources/main.c')
+          s = p.read_text()
+          if '__system_runflags' not in s or '__apt_appid' not in s:
+              needle = 'u32 __ctru_linear_heap_size = 0;'
+              if needle not in s:
+                  raise RuntimeError('libctru definitions anchor absent')
+              s = s.replace(needle,
+                            needle + '\n\nu32 __system_runflags = 0;\nu32 __apt_appid = 0;', 1)
+          p.write_text(s)
           PY
 
-      - name: Validate V8.9 version and safety markers
-        run: |
-          grep -Fq 'V8.9 %s' 3gx/sources/main.c
-          grep -Fq 'OFF - L+R+B' 3gx/sources/main.c
-          grep -Fq 'WALK VIA REHID' 3gx/sources/main.c
-          grep -Fq 'rowlet_v8_inject(KEY_DUP, false)' 3gx/sources/main.c
-          grep -Fq '#define V8_MAX_RESETS 0u' 3gx/sources/main.c
-
-      - name: Apply V9.0 high-frequency Circle Pad movement
+      - name: Check V12 configuration
         shell: bash
         run: |
-          python3 - <<'PYCODE'
-          from pathlib import Path
-          
-          hpath = Path('3gx/sources/hid.c')
-          dpath = Path('3gx/includes/hid.h')
-          mpath = Path('3gx/sources/main.c')
-          h, d, m = hpath.read_text(), dpath.read_text(), mpath.read_text()
-          
-          def once(s, old, new, label):
-              hits = s.count(old)
-              if hits != 1:
-                  raise SystemExit(f'V9.0: {label}: expected 1 anchor, saw {hits}')
-              return s.replace(old, new, 1)
-          
-          # Refresh the newest HID sample around every 2ms while walking.
-          # Unlike V8.9, this doesn't inject a D-pad button for Rehid to remap.
-          h += r'''
-          
-          // ROWLET_V90_HIGH_FREQ_CPAD
-          // Experimental helper thread, idle unless movement is armed.
-          static volatile unsigned v90_lease = 0;
-          static bool v90_thread_running = false;
-          
-          static void rowlet_v90_worker(void *unused)
-          {
-              (void)unused;
-              while (true) {
-                  if (v90_lease == 0) {
-                      svcSleepThread(12000000LL); // 12 ms idle
-                      continue;
-                  }
-                  --v90_lease;
-                  if (g_key_addr) {
-                      volatile u32 *base = g_key_addr - (0x28 / 4);
-                      u32 i = base[0x10 / 4];
-                      if (i < 8) {
-                          volatile u32 *slot = base + (0x28 / 4) + i * (0x10 / 4);
-                          u32 pa = svcConvertVAToPA((const void *)slot, false);
-                          if (pa) {
-                              volatile u32 *s = (volatile u32 *)(pa | 0x80000000u);
-                              s[3] = (u32)(145u << 16);
-                              s[0] = (s[0] & ~(KEY_CPAD_DOWN | KEY_CPAD_LEFT |
-                                                KEY_CPAD_RIGHT)) | KEY_CPAD_UP;
-                              s[1] |= KEY_CPAD_UP;
-                              s[2] &= ~KEY_CPAD_UP;
-                          }
-                      }
-                  }
-                  svcSleepThread(2000000LL); // 2ms, quicker than HID sample interval
-              }
-          }
-          
-          bool rowlet_v90_walk_keepalive(void)
-          {
-              if (!g_key_addr) return false;
-              if (!v90_thread_running) {
-                  Thread t = threadCreate(rowlet_v90_worker, NULL, 8192,
-                                          0x26, -2, true);
-                  if (!t) return false;
-                  v90_thread_running = true;
-              }
-              v90_lease = 35; // expires after ~70ms without a frame refresh
-              return true;
-          }
-          
-          void rowlet_v90_walk_off(void)
-          {
-              v90_lease = 0;
-          }
-          '''
-          
-          d += '''
-          // ROWLET_V90_HIGH_FREQ_CPAD
-          bool rowlet_v90_walk_keepalive(void);
-          void rowlet_v90_walk_off(void);
-          '''
-          
-          m = once(m,
-              'if (v8_frames < 28 && !rowlet_v8_inject(KEY_DUP, false)) {',
-              'if (v8_frames < 55 && !rowlet_v90_walk_keepalive()) {',
-              'replace virtual D-pad with high-frequency Circle Pad')
-          m = once(m,
-              'if (v8_frames >= 28) v8_go(4);',
-              'if (v8_frames >= 55) v8_go(4);',
-              'bound walking phase')
-          m = once(m,
-              'if (v8_state == 3) expected_virtual = KEY_DUP | KEY_CPAD_UP;',
-              'if (v8_state == 3) expected_virtual = KEY_CPAD_UP;',
-              'filter synthetic Circle Pad key')
-          m = once(m,
-              'static void v8_stop(unsigned status)\n{\n',
-              'static void v8_stop(unsigned status)\n{\n    rowlet_v90_walk_off();\n',
-              'stop movement on safety stop')
-          m = once(m,
-              'static void v8_go(unsigned state)\n{\n',
-              'static void v8_go(unsigned state)\n{\n    if (state != 3) rowlet_v90_walk_off();\n',
-              'stop movement on state transition')
-          m = once(m, 'V8.9 %s | R:%lu P:%lu E:%u FS:%u',
-                   'V9.0 %s | R:%lu P:%lu E:%u FS:%u', 'version label')
-          m = once(m, 'case 3: status="WALK VIA REHID";',
-                   'case 3: status="FAST CPAD WALK";', 'walking status')
-          
-          hpath.write_text(h)
-          dpath.write_text(d)
-          mpath.write_text(m)
-          print('V9.0 fast circle-pad helper installed; no Rehid remap needed.')
-          print('Automatic resets and auto-resume remain DISABLED.')
-          PYCODE
+          grep -Fq 'rowlet_v12_tick();' 3gx/sources/main.c
+          grep -Fq 'ROWLET: SHINY!' reader_core/src/gen7/frame.rs
+          grep -Fq 'ROWLET: NOT SHINY' reader_core/src/gen7/frame.rs
+          grep -Fq 'rowlet_try_inject_a_frame()' 3gx/sources/main.c
 
-      - name: Validate V9.0 safe movement patch
+      - name: Compile and capture errors
+        shell: bash
         run: |
-          grep -Fq 'V9.0 %s' 3gx/sources/main.c
-          grep -Fq 'FAST CPAD WALK' 3gx/sources/main.c
-          grep -Fq 'rowlet_v90_walk_keepalive()' 3gx/sources/main.c
-          grep -Fq 'ROWLET_V90_HIGH_FREQ_CPAD' 3gx/sources/hid.c
-          grep -Fq '#define V8_MAX_RESETS 0u' 3gx/sources/main.c
-          ! grep -Fq 'rowlet_v8_inject(KEY_L | KEY_R | KEY_START, false)' 3gx/sources/main.c
+          set -o pipefail
+          docker run --rm -v "$PWD:/work" -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v12_compile.log
 
-      - name: Compile new plugin
-        run: |
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            zaksabeast/devkitarm-rust make
-
-      - name: Upload V9.0 plugin
+      - name: Upload V12 plugin
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v9-0-fast-cpad-test
+          name: rowlet-v12-A-only-shiny-test
           path: out/default.3gx
           if-no-files-found: error
+
+      - name: Upload compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v12-compile-log
+          path: rowlet_v12_compile.log
+          if-no-files-found: warn
