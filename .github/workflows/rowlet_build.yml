@@ -1,136 +1,397 @@
 
-#!/usr/bin/env python3
-"""Rowlet V10.4 - Luma3DS Wi-Fi movement test.
+name: Build Rowlet AUTO v10.5 Standalone Test
 
-Requires:
-- 2DS XL and computer on the same Wi-Fi
-- Luma3DS InputRedirection enabled
-- rehid configured for D-pad Up to Circle Pad Up
+on:
+  workflow_dispatch:
 
-DRY RUN: No soft reset commands.
-"""
+permissions:
+  contents: read
 
-import argparse
-import socket
-import struct
-import time
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-PORT = 4950
+      - name: Apply Rowlet Watch
+        run: python3 patch/apply_patch.py .
 
-# Luma3DS uses active-low button states.
-RELEASED = 0x00000FFF
+      - name: Patch standalone guarded movement test
+        shell: bash
+        run: |
+          cat > /tmp/v105.py <<'PY'
+          from pathlib import Path
 
-UP = 1 << 6
-A = 1 << 0
+          root = Path('.')
 
-TOUCH_RELEASED = 0x02000000
-CIRCLE_CENTER = 0x007FF7FF
-CPP_CENTER = 0x80800081
+          def edit(path, old, new):
+              p = root / path
+              s = p.read_text()
+              count = s.count(old)
+              if count != 1:
+                  raise RuntimeError(
+                      f'{path}: expected one match, got {count}: {old!r}'
+                  )
+              p.write_text(s.replace(old, new, 1))
 
+          # Try writable HID mapping, fall back to original permissions.
+          edit('3gx/sources/main.c',
+          '''    u32 my_perm = has_write_perm ? MEMPERM_READ | MEMPERM_WRITE : MEMPERM_READ;
+              // Mimic the game's permissions
+              return svcMapMemoryBlock(memblock_handle, addr, my_perm, MEMPERM_DONTCARE);''',
+          '''    u32 my_perm = has_write_perm ? MEMPERM_READ | MEMPERM_WRITE : MEMPERM_READ;
+              if (!has_write_perm) {
+                  Result writable = svcMapMemoryBlock(memblock_handle, addr,
+                      MEMPERM_READ | MEMPERM_WRITE, MEMPERM_DONTCARE);
+                  if (R_SUCCEEDED(writable)) return writable;
+              }
+              return svcMapMemoryBlock(memblock_handle, addr, my_perm, MEMPERM_DONTCARE);''')
 
-def packet(keys=0):
-    mask = RELEASED & ~keys
+          # Frame-based injection, no background thread.
+          p = root / '3gx/sources/hid.c'
+          s = p.read_text()
+          s += '''
+          /* V10.5: guarded writable HID test. */
+          static volatile u32 rowlet_keys = 0;
+          static u32 rowlet_status = 0;
 
-    return struct.pack(
-        "<IIIII",
-        mask,
-        TOUCH_RELEASED,
-        CIRCLE_CENTER,
-        CPP_CENTER,
-        0
-    )
+          void rowlet_inject(u32 bits) {
+            rowlet_keys = bits & (KEY_DUP | KEY_A);
+          }
 
+          u32 rowlet_input_status(void) {
+            return rowlet_status;
+          }
 
-def send_for(sock, target, keys, duration):
-    end = time.monotonic() + duration
-    data = packet(keys)
+          void rowlet_pump(void) {
+            if (!g_key_addr) {
+              rowlet_status = 0;
+              return;
+            }
 
-    while time.monotonic() < end:
-        sock.sendto(data, target)
-        time.sleep(0.02)
+            MemInfo mi;
+            PageInfo pi;
 
+            if (R_FAILED(svcQueryMemory(
+                &mi, &pi, (u32)g_key_addr))) {
+              rowlet_status = 1;
+              return;
+            }
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Rowlet V10.4 Wi-Fi dry-run controller"
-    )
+            if (!(mi.perm & MEMPERM_WRITE)) {
+              rowlet_status = 1;
+              return;
+            }
 
-    parser.add_argument(
-        "ip",
-        help="3DS IP shown in Rosalina InputRedirection"
-    )
+            rowlet_status = 2;
 
-    parser.add_argument(
-        "--walk-seconds",
-        type=float,
-        default=2.0
-    )
+            if (rowlet_keys) {
+              *g_key_addr |= rowlet_keys;
+              rowlet_status = 3;
+            }
+          }
+          '''
+          p.write_text(s)
 
-    parser.add_argument(
-        "--dialog-seconds",
-        type=float,
-        default=90.0
-    )
+          p = root / '3gx/includes/hid.h'
+          p.write_text(p.read_text() + '''
+          void rowlet_inject(u32 bits);
+          u32 rowlet_input_status(void);
+          void rowlet_pump(void);
+          ''')
 
-    args = parser.parse_args()
+          edit(
+              '3gx/sources/main.c',
+              '        scan_input();\n        run_frame();',
+              '        scan_input();\n        run_frame();\n        rowlet_pump();'
+          )
 
-    if not (
-        0 < args.walk_seconds <= 15
-        and 0 <= args.dialog_seconds <= 180
-    ):
-        parser.error("Invalid movement or dialogue duration")
+          edit(
+              '3gx/sources/pnp.c',
+              'u32 host_just_pressed()\n',
+              '''void host_rowlet_inject(u32 keys) {
+            rowlet_inject(keys);
+          }
+          u32 host_rowlet_status() {
+            return rowlet_input_status();
+          }
+          u32 host_just_pressed()
+          '''
+          )
 
-    target = (args.ip, PORT)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          edit(
+              'reader_core/src/pnp/mod.rs',
+              'mod bindings;',
+              'pub(crate) mod bindings;'
+          )
 
-    print("ROWLET AUTO V10.4")
-    print("MODE: DRY RUN")
-    print("INPUT: D-PAD + REHID")
-    print("AUTOMATIC RESET: DISABLED")
-    print("Press Ctrl+C to stop.")
+          edit(
+              'reader_core/src/pnp/bindings.rs',
+              '    pub fn host_get_game_title_id() -> u64;',
+              '''    pub fn host_get_game_title_id() -> u64;
+              pub fn host_rowlet_inject(keys: u32);
+              pub fn host_rowlet_status() -> u32;'''
+          )
 
-    try:
-        print("Starting in 3 seconds...")
-        time.sleep(3)
+          auto = r'''
+          use super::rowlet_watch::{Phase, Watch};
+          use crate::pnp::{self, Button};
 
-        # Step 1: Walk forward.
-        print("STEP 1: D-PAD UP")
-        send_for(
-            sock,
-            target,
-            UP,
-            args.walk_seconds
-        )
+          const UP: u32 = 1 << 6;
+          const A: u32 = 1;
 
-        # Release the button.
-        send_for(sock, target, 0, 0.5)
+          #[derive(Clone, Copy, PartialEq, Eq)]
+          pub enum Step {
+              Off, Walk, Dialog, Check, Done, Shiny, Halt
+          }
 
-        # Step 2: Advance scene and select Rowlet.
-        print("STEP 2: PRESSING A")
-        print("Watching starter dialogue...")
+          impl Step {
+              pub fn label(self) -> &'static str {
+                  match self {
+                      Self::Off => "OFF: B+SELECT to arm",
+                      Self::Walk => "TEST: D-PAD UP",
+                      Self::Dialog => "TEST: sending A",
+                      Self::Check => "TEST: checking Rowlet",
+                      Self::Done => "DRY RUN DONE: non-shiny",
+                      Self::Shiny => "SHINY: STOPPED",
+                      Self::Halt => "STOPPED: verify console",
+                  }
+              }
+          }
 
-        end = time.monotonic() + args.dialog_seconds
+          pub struct Auto {
+              pub step: Step,
+              frames: u32,
+              debounce: u16,
+          }
 
-        while time.monotonic() < end:
-            send_for(sock, target, A, 0.14)
-            send_for(sock, target, 0, 0.65)
+          impl Auto {
+              pub const fn new() -> Self {
+                  Self {
+                      step: Step::Off,
+                      frames: 0,
+                      debounce: 0
+                  }
+              }
 
-        print("DRY RUN COMPLETED")
-        print("No reset sent.")
-        print("Check Rowlet Watch for shiny status.")
+              fn set(&mut self, next: Step) {
+                  self.step = next;
+                  self.frames = 0;
+              }
 
-    except KeyboardInterrupt:
-        print("STOPPED BY USER")
-        print("No reset sent.")
+              pub fn tick(&mut self, w: &Watch) {
+                  if self.debounce > 0 {
+                      self.debounce -= 1;
+                  }
 
-    finally:
-        # Release all controller buttons.
-        for _ in range(12):
-            sock.sendto(packet(0), target)
-            time.sleep(0.02)
+                  let toggle =
+                      pnp::is_pressing(Button::B) &&
+                      pnp::is_pressing(Button::Select);
 
-        sock.close()
+                  if toggle && self.debounce == 0 {
+                      self.debounce = 90;
 
+                      if self.step == Step::Off &&
+                         w.phase == Phase::WaitRowlet {
+                          self.set(Step::Walk);
+                      } else {
+                          self.set(Step::Off);
+                      }
+                  }
 
-if __name__ == "__main__":
-    main()
+                  if w.phase == Phase::Shiny {
+                      self.set(Step::Shiny);
+                  }
+
+                  if w.phase == Phase::Error {
+                      self.set(Step::Halt);
+                  }
+
+                  let mut keys = 0;
+
+                  match self.step {
+                      Step::Walk => {
+                          if self.frames < 120 {
+                              keys = UP;
+                          } else {
+                              self.set(Step::Dialog);
+                          }
+                      }
+
+                      Step::Dialog => {
+                          if w.phase == Phase::Verify ||
+                             w.phase == Phase::Reverify {
+                              self.set(Step::Check);
+                          } else if w.phase == Phase::Normal {
+                              self.set(Step::Done);
+                          } else if self.frames > 7200 {
+                              self.set(Step::Halt);
+                          } else if self.frames % 40 < 10 {
+                              keys = A;
+                          }
+                      }
+
+                      Step::Check => {
+                          if w.phase == Phase::Normal {
+                              self.set(Step::Done);
+                          } else if self.frames > 240 {
+                              self.set(Step::Halt);
+                          }
+                      }
+
+                      _ => {}
+                  }
+
+                  self.frames = self.frames.saturating_add(1);
+
+                  unsafe {
+                      crate::pnp::bindings::host_rowlet_inject(keys);
+                  }
+              }
+          }
+          '''
+
+          (
+              root / 'reader_core/src/gen7/rowlet_auto.rs'
+          ).write_text(auto)
+
+          edit(
+              'reader_core/src/gen7/mod.rs',
+              'mod reader;',
+              'mod reader;\nmod rowlet_auto;'
+          )
+
+          edit(
+              'reader_core/src/gen7/frame.rs',
+              'use super::rowlet_watch::{Sample, Watch};',
+              '''use super::rowlet_watch::{Sample, Watch};
+          use super::rowlet_auto::Auto;'''
+          )
+
+          edit(
+              'reader_core/src/gen7/frame.rs',
+              '    rowlet_watch: Watch,',
+              '    rowlet_watch: Watch,\n    rowlet_auto: Auto,'
+          )
+
+          edit(
+              'reader_core/src/gen7/frame.rs',
+              '        rowlet_watch: Watch::new(),',
+              '        rowlet_watch: Watch::new(),\n        rowlet_auto: Auto::new(),'
+          )
+
+          edit(
+              'reader_core/src/gen7/frame.rs',
+              '    state.sfmt.reinit_if_needed(reader.init_seed());',
+              '    if is_ultra_sun { state.rowlet_auto.tick(&state.rowlet_watch); }\n'
+              '    state.sfmt.reinit_if_needed(reader.init_seed());'
+          )
+
+          edit(
+              'reader_core/src/gen7/frame.rs',
+              'pnp::println!("ROWLET WATCH v5");',
+              'pnp::println!("ROWLET AUTO v10.5 TEST");'
+          )
+
+          edit(
+              'reader_core/src/gen7/frame.rs',
+              '            pnp::println!("Reset buttons: OFF");',
+              '''            pnp::println!("MODE: DRY RUN / NO RESET");
+                      pnp::println!("AUTO: {}", state.rowlet_auto.step.label());
+                      let input = unsafe { crate::pnp::bindings::host_rowlet_status() };
+                      pnp::println!("INPUT: {}", match input {
+                          0 => "UNMAPPED",
+                          1 => "READ ONLY - BLOCKED",
+                          2 => "WRITABLE",
+                          3 => "INPUT ATTEMPTED",
+                          _ => "UNKNOWN",
+                      });'''
+          )
+
+          print("V10.5 standalone dry-run test patched.")
+          PY
+          python3 /tmp/v105.py
+
+      - name: Fix libctru compatibility
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          ld = Path('3gx/3gx.ld')
+          code = ld.read_text()
+
+          if '__tdata_align' not in code:
+              needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
+              assert needle in code
+              code = code.replace(
+                  needle,
+                  needle +
+                  '\n\t\t__tdata_align = .;'
+                  '\n\t\tLONG (ALIGNOF(.tdata));'
+                  '\n\t\t. = ALIGN(4);',
+                  1
+              )
+
+          needle = (
+              '\t\t__tls_start = .;\n'
+              '\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
+          )
+
+          if needle in code:
+              code = code.replace(
+                  needle,
+                  '\t\t. = 8 + ABSOLUTE(ALIGN('
+                  'ABSOLUTE(. - 8), MAX(4, ALIGNOF(.tdata))));\n'
+                  '\t\t__tls_start = .;\n'
+                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
+                  1
+              )
+
+          ld.write_text(code)
+
+          src = Path('3gx/sources/main.c')
+          code = src.read_text()
+
+          if (
+              '__system_runflags' not in code or
+              '__apt_appid' not in code
+          ):
+              needle = 'u32 __ctru_linear_heap_size = 0;'
+              assert needle in code
+              code = code.replace(
+                  needle,
+                  needle +
+                  '\n\nu32 __system_runflags = 0;'
+                  '\nu32 __apt_appid = 0;',
+                  1
+              )
+
+          src.write_text(code)
+          PY
+
+      - name: Compile and save log
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee v105_compile.log
+
+      - name: Upload plugin
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v10-5-standalone-dry-run
+          path: out/default.3gx
+          if-no-files-found: error
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v10-5-compile-log
+          path: v105_compile.log
+          if-no-files-found: warn
