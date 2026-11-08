@@ -1,5 +1,5 @@
 
-name: Build Rowlet V11.1 Stick Trace Diagnostic
+name: Build Rowlet V11.2 Raw Stick XY Diagnostic
 
 on:
   workflow_dispatch:
@@ -17,38 +17,95 @@ jobs:
       - name: Apply original Rowlet Watch V5
         run: python3 patch/apply_patch.py .
 
-      - name: Instrument candidate stick routine
+      - name: Instrument exact stick input values
         shell: bash
         run: |
-          cat > /tmp/v111.py <<'PY'
+          cat > /tmp/v112.py <<'PY'
           from pathlib import Path
-
           main = Path('3gx/sources/main.c')
           s = main.read_text()
 
           observer = r'''
-          // V11.1 diagnostic, USA Ultra Sun v1.2.
-          #define V111_TITLE 0x00040000001B5000ULL
-          #define V111_TARGET 0x004B6DD8u
-          #define V111_OP0 0xE92D4070u
-          #define V111_OP1 0xE1A04000u
-          #define V111_JUMP 0xE51FF004u
+          // V11.2 Ultra Sun v1.2 raw stick diagnostic.
+          // No automatic movement, A presses, or resets.
+          #define V112_TITLE 0x00040000001B5000ULL
+          #define V112_TARGET 0x004B6DD8u
+          #define V112_OP0 0xE92D4070u
+          #define V112_OP1 0xE1A04000u
+          #define V112_JUMP 0xE51FF004u
 
-          __attribute__((used))
-          static volatile u32 v111_hits = 0;
+          // 0 READY, 1 RELEASE, 2 IDLE,
+          // 3 UP NOW, 4 DONE, 5 STOP.
+          static volatile u32 v112_phase = 0;
+          static u32 v112_hook_status = 0;
+          static u32 v112_frames = 0;
+          static u32 v112_release = 0;
 
-          static unsigned v111_hook_status = 0;
+          typedef struct {
+              volatile s32 min_x;
+              volatile s32 max_x;
+              volatile s32 min_y;
+              volatile s32 max_y;
+              volatile u32 samples;
+          } V112Samples;
 
+          static V112Samples v112_idle_samples;
+          static V112Samples v112_move_samples;
+
+          static void v112_clear(V112Samples *r)
+          {
+              r->min_x = 32767;
+              r->max_x = -32768;
+              r->min_y = 32767;
+              r->max_y = -32768;
+              r->samples = 0;
+          }
+
+          // The original function reads its source
+          // pointer at [r0+8], then signed values at
+          // source+12 (X) and source+14 (Y).
+          __attribute__((used, noinline))
+          static void v112_capture(const void *input)
+          {
+              u32 phase = v112_phase;
+
+              if (phase != 2 && phase != 3)
+                  return;
+
+              if (!input)
+                  return;
+
+              const volatile s16 *coords =
+                  (const volatile s16 *)(
+                      (const u8 *)input + 12
+                  );
+
+              s32 x = (s32)coords[0];
+              s32 y = (s32)coords[1];
+
+              V112Samples *r =
+                  phase == 2
+                  ? &v112_idle_samples
+                  : &v112_move_samples;
+
+              if (x < r->min_x) r->min_x = x;
+              if (x > r->max_x) r->max_x = x;
+              if (y < r->min_y) r->min_y = y;
+              if (y > r->max_y) r->max_y = y;
+
+              r->samples++;
+          }
+
+          // Preserve original registers and replay
+          // the two instructions being replaced.
           __attribute__((naked, used, noinline, aligned(4)))
-          static void v111_trampoline(void)
+          static void v112_trampoline(void)
           {
               __asm__ volatile(
                   ".arm\n"
                   "stmdb sp!, {r0-r3, r12, lr}\n"
-                  "ldr r12, =v111_hits\n"
-                  "ldr r0, [r12]\n"
-                  "add r0, r0, #1\n"
-                  "str r0, [r12]\n"
+                  "ldr r0, [r0, #8]\n"
+                  "bl v112_capture\n"
                   "ldmia sp!, {r0-r3, r12, lr}\n"
                   "stmdb sp!, {r4, r5, r6, lr}\n"
                   "mov r4, r0\n"
@@ -56,37 +113,35 @@ jobs:
               );
           }
 
-          static void v111_install(void)
+          static void v112_install(void)
           {
-              if (get_title_id() != V111_TITLE)
+              if (get_title_id() != V112_TITLE)
                   return;
 
               volatile u32 *code =
-                  (volatile u32 *)V111_TARGET;
+                  (volatile u32 *)V112_TARGET;
 
-              if (
-                  code[0] != V111_OP0 ||
-                  code[1] != V111_OP1
-              ) {
-                  v111_hook_status = 2;
+              if (code[0] != V112_OP0 ||
+                  code[1] != V112_OP1) {
+                  v112_hook_status = 2;
                   return;
               }
 
               u32 dest =
-                  (u32)(void *)v111_trampoline;
+                  (u32)(void *)v112_trampoline;
 
               if (dest & 3u) {
-                  v111_hook_status = 4;
+                  v112_hook_status = 4;
                   return;
               }
 
               u32 pa = svcConvertVAToPA(
-                  (const void *)V111_TARGET,
+                  (const void *)V112_TARGET,
                   false
               );
 
               if (!pa || (pa & 3u)) {
-                  v111_hook_status = 3;
+                  v112_hook_status = 3;
                   return;
               }
 
@@ -95,166 +150,172 @@ jobs:
                       pa | 0x80000000u
                   );
 
-              // Installed at startup, before
-              // normal gameplay begins.
               p[1] = dest;
-              p[0] = V111_JUMP;
+              p[0] = V112_JUMP;
 
               svcInvalidateEntireInstructionCache();
 
-              v111_hook_status = 1;
+              v112_hook_status = 1;
           }
 
-          // 0 READY
-          // 1 RELEASE
-          // 2 IDLE
-          // 3 STEP NOW
-          // 4 DONE
-          // 5 STOPPED
-
-          static unsigned v111_phase = 0;
-          static unsigned v111_frames = 0;
-          static unsigned v111_release = 0;
-
-          static u32 v111_begin = 0;
-          static u32 v111_walk_begin = 0;
-          static u32 v111_idle = 0;
-          static u32 v111_walk = 0;
-
-          static void v111_tick(void)
+          static void v112_tick(void)
           {
-              if (
-                  get_title_id() != V111_TITLE ||
-                  v111_hook_status != 1
-              )
+              if (get_title_id() != V112_TITLE ||
+                  v112_hook_status != 1)
                   return;
 
               u32 keys = get_current_keys();
 
-              // No X-button trigger.
+              // L + R + Y trigger. No X.
               const u32 trigger =
                   KEY_L | KEY_R | KEY_Y;
 
-              if (v111_phase == 0) {
-                  if (
-                      (keys & trigger) == trigger &&
-                      !(keys & KEY_X)
-                  ) {
-                      v111_release = 0;
-                      v111_frames = 0;
-                      v111_idle = 0;
-                      v111_walk = 0;
-                      v111_phase = 1;
+              if (v112_phase == 0) {
+                  if ((keys & trigger) == trigger &&
+                      !(keys & KEY_X)) {
+
+                      v112_clear(&v112_idle_samples);
+                      v112_clear(&v112_move_samples);
+
+                      v112_frames = 0;
+                      v112_release = 0;
+                      v112_phase = 1;
                   }
 
                   return;
               }
 
               if (keys & KEY_B) {
-                  v111_phase = 5;
+                  v112_phase = 5;
                   return;
               }
 
-              if (v111_phase == 1) {
-                  v111_release =
+              if (v112_phase == 1) {
+                  v112_release =
                       keys == 0
-                      ? v111_release + 1
+                      ? v112_release + 1
                       : 0;
 
-                  if (++v111_frames >= 600) {
-                      v111_phase = 5;
+                  if (++v112_frames >= 600) {
+                      v112_phase = 5;
                       return;
                   }
 
-                  if (v111_release >= 15) {
-                      v111_begin = v111_hits;
-                      v111_frames = 0;
-                      v111_phase = 2;
+                  if (v112_release >= 15) {
+                      v112_frames = 0;
+                      v112_phase = 2;
                   }
 
                   return;
               }
 
-              if (v111_phase == 2) {
-                  // Count calls while standing still.
-                  v111_idle =
-                      v111_hits - v111_begin;
-
-                  if (++v111_frames >= 180) {
-                      v111_walk_begin = v111_hits;
-                      v111_frames = 0;
-                      v111_phase = 3;
+              if (v112_phase == 2) {
+                  // Three seconds standing still.
+                  if (++v112_frames >= 180) {
+                      v112_frames = 0;
+                      v112_phase = 3;
                   }
-
-                  return;
               }
 
-              if (v111_phase == 3) {
-                  // Count calls during physical Up.
-                  v111_walk =
-                      v111_hits - v111_walk_begin;
-
-                  if (++v111_frames >= 180)
-                      v111_phase = 4;
+              else if (v112_phase == 3) {
+                  // Three seconds moving physically.
+                  if (++v112_frames >= 180)
+                      v112_phase = 4;
               }
           }
 
-          static void v111_overlay(void)
+          static void v112_overlay(void)
           {
-              if (get_title_id() != V111_TITLE)
+              if (get_title_id() != V112_TITLE)
                   return;
 
-              const char *phase = "READY";
+              const char *state = "READY";
 
-              if (v111_hook_status == 0)
-                  phase = "NOT READY";
+              if (v112_hook_status == 0)
+                  state = "NOT READY";
 
-              if (v111_hook_status == 2)
-                  phase = "ERR: OPCODE";
+              if (v112_hook_status == 2)
+                  state = "ERR OPCODE";
 
-              if (v111_hook_status == 3)
-                  phase = "ERR: ADDRESS";
+              if (v112_hook_status == 3)
+                  state = "ERR ADDRESS";
 
-              if (v111_hook_status == 4)
-                  phase = "ERR: ALIGN";
+              if (v112_hook_status == 4)
+                  state = "ERR ALIGN";
 
-              if (v111_hook_status == 1) {
-                  if (v111_phase == 1)
-                      phase = "RELEASE";
+              if (v112_hook_status == 1) {
+                  if (v112_phase == 1)
+                      state = "RELEASE";
 
-                  if (v111_phase == 2)
-                      phase = "IDLE";
+                  if (v112_phase == 2)
+                      state = "IDLE";
 
-                  if (v111_phase == 3)
-                      phase = "STEP NOW";
+                  if (v112_phase == 3)
+                      state = "UP NOW";
 
-                  if (v111_phase == 4)
-                      phase = "DONE";
+                  if (v112_phase == 4)
+                      state = "DONE";
 
-                  if (v111_phase == 5)
-                      phase = "STOPPED";
+                  if (v112_phase == 5)
+                      state = "STOP";
               }
 
-              char buf[48];
-
-              host_print(
-                  (u32)"V11.1 STICK TRACE",
-                  17,
-                  0x00ffff
-              );
-
-              host_print(
-                  (u32)"L+R+Y / B:STOP",
-                  14,
-                  0x00ffff
-              );
+              char buf[80];
 
               snprintf(
                   buf,
                   sizeof(buf),
-                  "STATE:%s",
-                  phase
+                  "V11.2 %s",
+                  state
               );
+
+              host_print(
+                  (u32)buf,
+                  strlen(buf),
+                  0x00ffff
+              );
+
+              if (v112_idle_samples.samples) {
+                  snprintf(
+                      buf,
+                      sizeof(buf),
+                      "I X:%ld/%ld Y:%ld/%ld",
+                      (long)v112_idle_samples.min_x,
+                      (long)v112_idle_samples.max_x,
+                      (long)v112_idle_samples.min_y,
+                      (long)v112_idle_samples.max_y
+                  );
+              } else {
+                  snprintf(
+                      buf,
+                      sizeof(buf),
+                      "I X:-- Y:--"
+                  );
+              }
+
+              host_print(
+                  (u32)buf,
+                  strlen(buf),
+                  0x00ffff
+              );
+
+              if (v112_move_samples.samples) {
+                  snprintf(
+                      buf,
+                      sizeof(buf),
+                      "M X:%ld/%ld Y:%ld/%ld",
+                      (long)v112_move_samples.min_x,
+                      (long)v112_move_samples.max_x,
+                      (long)v112_move_samples.min_y,
+                      (long)v112_move_samples.max_y
+                  );
+              } else {
+                  snprintf(
+                      buf,
+                      sizeof(buf),
+                      "M X:-- Y:--"
+                  );
+              }
 
               host_print(
                   (u32)buf,
@@ -265,9 +326,11 @@ jobs:
               snprintf(
                   buf,
                   sizeof(buf),
-                  "ID:%lu MV:%lu",
-                  (unsigned long)v111_idle,
-                  (unsigned long)v111_walk
+                  "N:%lu/%lu LRY START",
+                  (unsigned long)
+                      v112_idle_samples.samples,
+                  (unsigned long)
+                      v112_move_samples.samples
               );
 
               host_print(
@@ -282,7 +345,7 @@ jobs:
 
           if s.count(needle) != 1:
               raise RuntimeError(
-                  'V11.1 run_hook insertion point missing'
+                  'V11.2 run_hook insertion missing'
               )
 
           s = s.replace(
@@ -299,15 +362,15 @@ jobs:
 
           new = (
               '        scan_input();\n'
-              '        v111_tick();\n'
+              '        v112_tick();\n'
               '        run_frame();\n'
-              '        v111_overlay();\n'
+              '        v112_overlay();\n'
               '        draw_to_screen(screenId, fb_a, stride, format);'
           )
 
           if s.count(old) != 1:
               raise RuntimeError(
-                  'V11.1 framebuffer hook not found'
+                  'V11.2 framebuffer hook missing'
               )
 
           s = s.replace(old, new, 1)
@@ -319,24 +382,26 @@ jobs:
 
           new = (
               '    initialize();\n'
-              '    v111_install();\n'
+              '    v112_install();\n'
               '    svcInvalidateEntireInstructionCache();'
           )
 
           if s.count(old) != 1:
               raise RuntimeError(
-                  'V11.1 startup hook not found'
+                  'V11.2 startup hook missing'
               )
 
           s = s.replace(old, new, 1)
 
           main.write_text(s)
 
-          print("V11.1 diagnostic installed")
-          print("No automatic inputs or resets")
+          print("V11.2 diagnostic installed")
+          print("Input: Physical D-pad + rehid")
+          print("Automatic input: DISABLED")
+          print("Automatic reset: DISABLED")
           PY
 
-          python3 /tmp/v111.py
+          python3 /tmp/v112.py
 
       - name: Fix libctru compatibility
         shell: bash
@@ -348,11 +413,9 @@ jobs:
           code = ld.read_text()
 
           if '__tdata_align' not in code:
-              needle = (
-                  'SORT(CONSTRUCTORS)\n'
-                  '\t\t. = ALIGN(4);'
-              )
+              needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
               assert needle in code
+
               code = code.replace(
                   needle,
                   needle +
@@ -374,7 +437,8 @@ jobs:
                   'ABSOLUTE(. - 8), '
                   'MAX(4, ALIGNOF(.tdata))));\n'
                   '\t\t__tls_start = .;\n'
-                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
+                  '\t\t. += SIZEOF(.tdata) + '
+                  'SIZEOF(.tbss);',
                   1
               )
 
@@ -387,10 +451,7 @@ jobs:
               '__system_runflags' not in code or
               '__apt_appid' not in code
           ):
-              needle = (
-                  'u32 __ctru_linear_heap_size = 0;'
-              )
-
+              needle = 'u32 __ctru_linear_heap_size = 0;'
               assert needle in code
 
               code = code.replace(
@@ -412,13 +473,13 @@ jobs:
             -v "$PWD:/work" \
             -w /work \
             zaksabeast/devkitarm-rust make \
-            2>&1 | tee v111_compile.log
+            2>&1 | tee v112_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v11-1-stick-trace
+          name: rowlet-v11-2-xy-diagnostic
           path: out/default.3gx
           if-no-files-found: error
 
@@ -426,6 +487,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v11-1-compile-log
-          path: v111_compile.log
+          name: rowlet-v11-2-compile-log
+          path: v112_compile.log
           if-no-files-found: warn
