@@ -1,32 +1,41 @@
-// Hand-pivoting museum-style classroom display, non-locking and non-load-bearing.
-$fn=72;
-module original(){import("/mnt/data/single_color.stl");}
-module cross_y(r,len){rotate([90,0,0]) cylinder(r=r,h=len,center=true);}
-// Keep the original shank and head silhouettes wherever possible.
-module lower(){intersection(){original();translate([-20,-20,-60])cube([40,40,89.2]);}}
-module upper(){intersection(){original();translate([-20,-20,30.6])cube([40,40,30]);}}
-module shank(){
- difference(){union(){
-  lower();
-  // flattened fork: each cheek joins original iron below the cut
-  translate([1.3,-1.75,28.8])cube([3.4,1.25,5.8],center=true);
-  translate([1.3, 1.75,28.8])cube([3.4,1.25,5.8],center=true);
-  translate([1.3,-1.75,30.2])cross_y(2.0,1.25);
-  translate([1.3, 1.75,30.2])cross_y(2.0,1.25);
- }translate([1.3,0,30.2])cross_y(1.12,6.0);}
-}
-module head(){
- difference(){union(){
-  upper();
-  // central eye and tongue between fork cheeks
-  translate([1.3,0,31.3])cube([2.65,1.8,3.4],center=true);
-  translate([1.3,0,30.2])cross_y(1.95,1.8);
- }translate([1.3,0,30.2])cross_y(1.12,4.5);}
-}
-module pin(){
- union(){cross_y(0.95,5.0);translate([0,2.7,0])cross_y(1.55,0.4);}
-}
-part="shank";
-if(part=="shank")shank();
-else if(part=="head")head();
-else if(part=="pin")pin();
+
+name: Build Rowlet Watch V8.3
+
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Apply V5 detector
+        run: python3 patch/apply_patch.py .
+
+      - name: Apply V6 A-button test
+        run: python3 patch/apply_input_test.py .
+
+      - name: Apply V7.1 reset test
+        run: python3 patch/apply_reset_test.py .
+
+      - name: Apply V8.3 resume controller
+        run: python3 patch/apply_v8_3.py .
+
+      - name: Compile plugin
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            zaksabeast/devkitarm-rust make
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-watch-v8-3-plugin
+          path: out/default.3gx
+          if-no-files-found: error
