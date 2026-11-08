@@ -1,5 +1,5 @@
 
-name: Build Rowlet AUTO v10.5.1 MAIN MENU STATUS
+name: Build Rowlet V10.6 V6 Input Bridge DRY RUN
 
 on:
   workflow_dispatch:
@@ -14,389 +14,225 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply Rowlet Watch
+      - name: Apply Rowlet Watch V5
         run: python3 patch/apply_patch.py .
 
-      - name: Patch standalone movement test
+      - name: Apply original V6 virtual A test
+        run: python3 patch/apply_input_test.py .
+
+      - name: Combine V6 input with short D-pad and A test
         shell: bash
         run: |
-          cat > /tmp/v105.py <<'PY'
+          cat > /tmp/v106.py <<'PY'
           from pathlib import Path
 
-          root = Path('.')
+          main = Path('3gx/sources/main.c')
+          hid = Path('3gx/sources/hid.c')
+          header = Path('3gx/includes/hid.h')
+          m = main.read_text()
+          h = hid.read_text()
+          d = header.read_text()
 
-          def edit(path, old, new):
-              p = root / path
-              s = p.read_text()
-              count = s.count(old)
+          def once(source, old, new, label):
+              count = source.count(old)
               if count != 1:
-                  raise RuntimeError(
-                      f'{path}: expected one match, '
-                      f'got {count}: {old!r}'
-                  )
-              p.write_text(s.replace(old, new, 1))
+                  raise RuntimeError(f'{label}: expected 1 anchor, found {count}')
+              return source.replace(old, new, 1)
 
-          # Attempt writable HID mapping; fall back
-          # to original read-only permissions.
-          edit(
-              '3gx/sources/main.c',
-              '''    u32 my_perm = has_write_perm ? MEMPERM_READ | MEMPERM_WRITE : MEMPERM_READ;
-              // Mimic the game's permissions
-              return svcMapMemoryBlock(memblock_handle, addr, my_perm, MEMPERM_DONTCARE);''',
-              '''    u32 my_perm = has_write_perm ? MEMPERM_READ | MEMPERM_WRITE : MEMPERM_READ;
-              if (!has_write_perm) {
-                  Result writable = svcMapMemoryBlock(
-                      memblock_handle, addr,
-                      MEMPERM_READ | MEMPERM_WRITE,
-                      MEMPERM_DONTCARE
-                  );
-                  if (R_SUCCEEDED(writable)) return writable;
-              }
-              return svcMapMemoryBlock(
-                  memblock_handle, addr, my_perm,
-                  MEMPERM_DONTCARE
-              );'''
-          )
+          # Reuse the V6 virtual input method.
+          # No background HID thread or automatic resets.
+          h = once(h, '#include "common.h"',
+                   '#include "common.h"\n#include "csvc.h"', 'csvc header')
+          h += r'''
+          // V10.6: V6-style single-frame button injection.
+          // Experimental: a successful write is not proof
+          // that Ultra Sun or rehid received a button.
+          bool rowlet_v106_inject(u32 bits)
+          {
+              if (!g_key_addr) return false;
+              bits &= (KEY_A | KEY_DUP);
+              if (!bits) return false;
+              volatile u32 *base = g_key_addr - (0x28 / 4);
+              u32 index = base[0x10 / 4];
+              if (index >= 8) return false;
+              volatile u32 *sample = base + (0x28 / 4) + index * (0x10 / 4);
+              u32 sample_pa = svcConvertVAToPA((const void *)sample, false);
+              u32 current_pa = svcConvertVAToPA(
+                  (const void *)(base + (0x1c / 4)), false);
+              if (!sample_pa || !current_pa) return false;
+              volatile u32 *s = (volatile u32 *)(sample_pa | 0x80000000u);
+              volatile u32 *cur = (volatile u32 *)(current_pa | 0x80000000u);
+              s[0] |= bits;
+              s[1] |= bits;
+              *cur |= bits;
+              return true;
+          }
+          '''
+          d += '\nbool rowlet_v106_inject(u32 bits);\n'
 
-          # No background threads or physical-memory aliases.
-          p = root / '3gx/sources/hid.c'
-          s = p.read_text()
+          controller = r'''
+          // V10.6 manual, one-cycle dry run.
+          // 0 READY, 1 RELEASE, 2 UP, 3 A, 4 DONE, 5 STOP.
+          static unsigned v106_state = 0;
+          static unsigned v106_frames = 0;
+          static unsigned v106_idle = 0;
+          static unsigned v106_up_calls = 0;
+          static unsigned v106_a_calls = 0;
+          static const char *v106_error = "";
+          #define V106_TITLE 0x00040000001B5000ULL
 
-          s += '''
-          static volatile u32 rowlet_keys = 0;
-          static u32 rowlet_status = 0;
-
-          void rowlet_inject(u32 bits) {
-              rowlet_keys = bits & (KEY_DUP | KEY_A);
+          static void v106_set(unsigned state)
+          {
+              v106_state = state;
+              v106_frames = 0;
           }
 
-          u32 rowlet_input_status(void) {
-              return rowlet_status;
+          static void rowlet_v106_tick(void)
+          {
+              if (get_title_id() != V106_TITLE) return;
+              const u32 keys = get_current_keys();
+              const u32 start = KEY_L | KEY_X | KEY_Y;
+
+              if (v106_state == 0) {
+                  if (keys == start) {
+                      v106_up_calls = 0;
+                      v106_a_calls = 0;
+                      v106_idle = 0;
+                      v106_set(1);
+                  }
+                  return;
+              }
+
+              // Physical B is the emergency stop.
+              if (keys & KEY_B) {
+                  v106_error = "MANUAL STOP";
+                  v106_set(5);
+                  return;
+              }
+
+              if (v106_state >= 4) return;
+
+              if (v106_state == 1) {
+                  v106_idle = (keys == 0) ? v106_idle + 1 : 0;
+                  if (v106_idle >= 15) v106_set(2);
+                  if (++v106_frames > 600) {
+                      v106_error = "RELEASE TIMEOUT";
+                      v106_set(5);
+                  }
+                  return;
+              }
+
+              // Ignore residual virtual A and D-pad Up.
+              if ((keys & ~(KEY_DUP | KEY_A)) != 0) {
+                  v106_error = "OTHER KEY PRESSED";
+                  v106_set(5);
+                  return;
+              }
+
+              if (v106_state == 2) {
+                  // Attempt D-pad Up for 120 rendered frames.
+                  if (v106_frames < 120) {
+                      if (!rowlet_v106_inject(KEY_DUP)) {
+                          v106_error = "UP INJECT FAILED";
+                          v106_set(5);
+                          return;
+                      }
+                      ++v106_up_calls;
+                  } else {
+                      v106_set(3);
+                      return;
+                  }
+              } else if (v106_state == 3) {
+                  // 10 short A pulses, no continuous loop.
+                  if (v106_frames < 350) {
+                      if ((v106_frames % 35) < 6) {
+                          if (!rowlet_v106_inject(KEY_A)) {
+                              v106_error = "A INJECT FAILED";
+                              v106_set(5);
+                              return;
+                          }
+                          ++v106_a_calls;
+                      }
+                  } else {
+                      v106_set(4);
+                      return;
+                  }
+              }
+
+              ++v106_frames;
           }
 
-          void rowlet_pump(void) {
-              if (!g_key_addr) {
-                  rowlet_status = 0;
-                  return;
-              }
+          static void rowlet_v106_overlay(void)
+          {
+              if (get_title_id() != V106_TITLE) return;
 
-              MemInfo mi;
-              PageInfo pi;
+              const char *state = "READY L+X+Y";
+              if (v106_state == 1) state = "RELEASE BUTTONS";
+              if (v106_state == 2) state = "UP INJECTION ATTEMPT";
+              if (v106_state == 3) state = "A INJECTION ATTEMPT";
+              if (v106_state == 4) state = "DRY RUN FINISHED";
+              if (v106_state == 5) state = v106_error;
 
-              if (R_FAILED(svcQueryMemory(
-                  &mi, &pi, (u32)g_key_addr
-              ))) {
-                  rowlet_status = 1;
-                  return;
-              }
+              char buf[128];
+              snprintf(buf, sizeof(buf),
+                       "V10.6 DRY / NO RESET: %s", state);
+              host_print((u32)buf, strlen(buf), 0x00ffff);
 
-              if (!(mi.perm & MEMPERM_WRITE)) {
-                  rowlet_status = 1;
-                  return;
-              }
+              snprintf(buf, sizeof(buf),
+                       "UP frames: %u  A frames: %u",
+                       v106_up_calls, v106_a_calls);
+              host_print((u32)buf, strlen(buf), 0x00ffff);
 
-              rowlet_status = 2;
-
-              if (rowlet_keys) {
-                  *g_key_addr |= rowlet_keys;
-                  rowlet_status = 3;
-              }
+              host_print(
+                  (u32)"B: STOP / INPUT NOT VERIFIED",
+                  28, 0x00ffff
+              );
           }
           '''
 
-          p.write_text(s)
-
-          p = root / '3gx/includes/hid.h'
-          p.write_text(
-              p.read_text() +
-              '''
-          void rowlet_inject(u32 bits);
-          u32 rowlet_input_status(void);
-          void rowlet_pump(void);
-          '''
+          m = once(
+              m, 'void run_hook(',
+              controller + '\nvoid run_hook(',
+              'controller location'
           )
 
-          edit(
-              '3gx/sources/main.c',
-              '        scan_input();\n        run_frame();',
+          # Replace the original V6 diagnostic block.
+          # Show all status information on the main popup.
+          hook_start = (
               '        scan_input();\n'
-              '        run_frame();\n'
-              '        rowlet_pump();'
+              '        rowlet_a_test_tick();\n'
+              '        run_frame();'
+          )
+          hook_end = (
+              '        draw_to_screen(screenId, fb_a, stride, format);'
           )
 
-          edit(
-              '3gx/sources/pnp.c',
-              'u32 host_just_pressed()\n',
-              '''void host_rowlet_inject(u32 keys) {
-              rowlet_inject(keys);
-          }
+          if m.count(hook_start) != 1 or m.count(hook_end) != 1:
+              raise RuntimeError('Expected unique V6 overlay hook not found')
 
-          u32 host_rowlet_status() {
-              return rowlet_input_status();
-          }
-
-          u32 host_just_pressed()
-          '''
+          a = m.index(hook_start)
+          b = m.index(hook_end, a) + len(hook_end)
+          m = (
+              m[:a]
+              + '        scan_input();\n'
+              + '        rowlet_v106_tick();\n'
+              + '        run_frame();\n'
+              + '        rowlet_v106_overlay();\n'
+              + hook_end
+              + m[b:]
           )
 
-          edit(
-              'reader_core/src/pnp/mod.rs',
-              'mod bindings;',
-              'pub(crate) mod bindings;'
-          )
+          main.write_text(m)
+          hid.write_text(h)
+          header.write_text(d)
 
-          edit(
-              'reader_core/src/pnp/bindings.rs',
-              '    pub fn host_get_game_title_id() -> u64;',
-              '''    pub fn host_get_game_title_id() -> u64;
-              pub fn host_rowlet_inject(keys: u32);
-              pub fn host_rowlet_status() -> u32;'''
-          )
-
-          # Standalone automation state machine.
-          auto = r'''
-          use super::rowlet_watch::{Phase, Watch};
-          use crate::pnp::{self, Button};
-
-          const UP: u32 = 1 << 6;
-          const A: u32 = 1;
-
-          #[derive(Clone, Copy, PartialEq, Eq)]
-          pub enum Step {
-              Off,
-              Walk,
-              Dialog,
-              Check,
-              Done,
-              Shiny,
-              Halt,
-          }
-
-          impl Step {
-              pub fn label(self) -> &'static str {
-                  match self {
-                      Self::Off =>
-                          "OFF: B+SELECT",
-                      Self::Walk =>
-                          "TEST: D-PAD UP",
-                      Self::Dialog =>
-                          "TEST: sending A",
-                      Self::Check =>
-                          "TEST: checking Rowlet",
-                      Self::Done =>
-                          "DRY RUN DONE",
-                      Self::Shiny =>
-                          "SHINY: STOPPED",
-                      Self::Halt =>
-                          "STOPPED: check game",
-                  }
-              }
-          }
-
-          pub struct Auto {
-              pub step: Step,
-              frames: u32,
-              debounce: u16,
-          }
-
-          impl Auto {
-              pub const fn new() -> Self {
-                  Self {
-                      step: Step::Off,
-                      frames: 0,
-                      debounce: 0,
-                  }
-              }
-
-              fn set(&mut self, next: Step) {
-                  self.step = next;
-                  self.frames = 0;
-              }
-
-              pub fn tick(&mut self, w: &Watch) {
-                  if self.debounce > 0 {
-                      self.debounce -= 1;
-                  }
-
-                  let toggle =
-                      pnp::is_pressing(Button::B) &&
-                      pnp::is_pressing(Button::Select);
-
-                  if toggle && self.debounce == 0 {
-                      self.debounce = 90;
-
-                      if self.step == Step::Off &&
-                         w.phase == Phase::WaitRowlet {
-                          self.set(Step::Walk);
-                      } else {
-                          self.set(Step::Off);
-                      }
-                  }
-
-                  if w.phase == Phase::Shiny {
-                      self.set(Step::Shiny);
-                  }
-
-                  if w.phase == Phase::Error {
-                      self.set(Step::Halt);
-                  }
-
-                  let mut keys: u32 = 0;
-
-                  match self.step {
-                      Step::Walk => {
-                          if self.frames < 120 {
-                              keys = UP;
-                          } else {
-                              self.set(Step::Dialog);
-                          }
-                      }
-
-                      Step::Dialog => {
-                          if w.phase == Phase::Verify ||
-                             w.phase == Phase::Reverify {
-                              self.set(Step::Check);
-                          } else if w.phase == Phase::Normal {
-                              self.set(Step::Done);
-                          } else if self.frames > 7200 {
-                              self.set(Step::Halt);
-                          } else if self.frames % 40 < 10 {
-                              keys = A;
-                          }
-                      }
-
-                      Step::Check => {
-                          if w.phase == Phase::Normal {
-                              self.set(Step::Done);
-                          } else if self.frames > 240 {
-                              self.set(Step::Halt);
-                          }
-                      }
-
-                      _ => {}
-                  }
-
-                  self.frames =
-                      self.frames.saturating_add(1);
-
-                  unsafe {
-                      crate::pnp::bindings::
-                          host_rowlet_inject(keys);
-                  }
-              }
-          }
-          '''
-
-          (
-              root / 'reader_core/src/gen7/rowlet_auto.rs'
-          ).write_text(auto)
-
-          edit(
-              'reader_core/src/gen7/mod.rs',
-              'mod reader;',
-              'mod reader;\nmod rowlet_auto;'
-          )
-
-          edit(
-              'reader_core/src/gen7/frame.rs',
-              'use super::rowlet_watch::{Sample, Watch};',
-              '''use super::rowlet_watch::{Sample, Watch};
-          use super::rowlet_auto::Auto;'''
-          )
-
-          edit(
-              'reader_core/src/gen7/frame.rs',
-              '    rowlet_watch: Watch,',
-              '    rowlet_watch: Watch,\n'
-              '    rowlet_auto: Auto,'
-          )
-
-          edit(
-              'reader_core/src/gen7/frame.rs',
-              '        rowlet_watch: Watch::new(),',
-              '        rowlet_watch: Watch::new(),\n'
-              '        rowlet_auto: Auto::new(),'
-          )
-
-          edit(
-              'reader_core/src/gen7/frame.rs',
-              '    state.sfmt.reinit_if_needed(reader.init_seed());',
-              '''    if is_ultra_sun {
-                  state.rowlet_auto.tick(&state.rowlet_watch);
-              }
-              state.sfmt.reinit_if_needed(reader.init_seed());'''
-          )
-
-          # Keep Rowlet Watch information available.
-          edit(
-              'reader_core/src/gen7/frame.rs',
-              'pnp::println!("ROWLET WATCH v5");',
-              'pnp::println!("ROWLET AUTO v10.5.1");'
-          )
-
-          edit(
-              'reader_core/src/gen7/frame.rs',
-              '            pnp::println!("Reset buttons: OFF");',
-              '''            pnp::println!("MODE: DRY RUN / NO RESET");
-                          pnp::println!(
-                              "AUTO: {}",
-                              state.rowlet_auto.step.label()
-                          );
-                          let input = unsafe {
-                              crate::pnp::bindings::
-                                  host_rowlet_status()
-                          };
-                          pnp::println!("INPUT: {}", match input {
-                              0 => "UNMAPPED",
-                              1 => "READ ONLY - BLOCKED",
-                              2 => "WRITABLE",
-                              3 => "INPUT ATTEMPTED",
-                              _ => "UNKNOWN",
-                          });'''
-          )
-
-          # NEW: Display status on PokeReader's MAIN MENU.
-          # This avoids needing to enter Rowlet Watch
-          # while rehid is enabled.
-          edit(
-              'reader_core/src/gen7/frame.rs',
-              '            state.main_menu.draw();',
-              '''            state.main_menu.draw();
-
-                          if is_ultra_sun {
-                              pnp::println!("ROWLET v10.5.1 DRY");
-                              pnp::println!("B+SELECT: START/STOP");
-                              pnp::println!(
-                                  "AUTO: {}",
-                                  state.rowlet_auto.step.label()
-                              );
-
-                              let input = unsafe {
-                                  crate::pnp::bindings::
-                                      host_rowlet_status()
-                              };
-
-                              pnp::println!("INPUT: {}", match input {
-                                  0 => "UNMAPPED",
-                                  1 => "READ ONLY - BLOCKED",
-                                  2 => "WRITABLE",
-                                  3 => "INPUT ATTEMPTED",
-                                  _ => "UNKNOWN",
-                              });
-
-                              pnp::println!("NO SOFT RESET");
-                          }'''
-          )
-
-          print("V10.5.1 main-menu status installed.")
-          print("Input: D-pad + rehid")
-          print("Mode: DRY RUN")
-          print("Automatic reset: DISABLED")
+          print('V10.6 V6-style input bridge patched')
+          print('Dry run: no automatic resets')
           PY
 
-          python3 /tmp/v105.py
+          python3 /tmp/v106.py
 
-      - name: Fix libctru compatibility
+      - name: Fix libctru 2.4.1 compatibility
         shell: bash
         run: |
           python3 - <<'PY'
@@ -411,10 +247,10 @@ jobs:
 
               code = code.replace(
                   needle,
-                  needle +
-                  '\n\t\t__tdata_align = .;'
-                  '\n\t\tLONG (ALIGNOF(.tdata));'
-                  '\n\t\t. = ALIGN(4);',
+                  needle
+                  + '\n\t\t__tdata_align = .;'
+                  + '\n\t\tLONG (ALIGNOF(.tdata));'
+                  + '\n\t\t. = ALIGN(4);',
                   1
               )
 
@@ -427,11 +263,9 @@ jobs:
               code = code.replace(
                   needle,
                   '\t\t. = 8 + ABSOLUTE(ALIGN('
-                  'ABSOLUTE(. - 8), MAX(4, '
-                  'ALIGNOF(.tdata))));\n'
+                  'ABSOLUTE(. - 8), MAX(4, ALIGNOF(.tdata))));\n'
                   '\t\t__tls_start = .;\n'
-                  '\t\t. += SIZEOF(.tdata) + '
-                  'SIZEOF(.tbss);',
+                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
                   1
               )
 
@@ -440,45 +274,40 @@ jobs:
           src = Path('3gx/sources/main.c')
           code = src.read_text()
 
-          if (
-              '__system_runflags' not in code or
-              '__apt_appid' not in code
-          ):
+          if '__system_runflags' not in code or '__apt_appid' not in code:
               needle = 'u32 __ctru_linear_heap_size = 0;'
               assert needle in code
 
               code = code.replace(
                   needle,
-                  needle +
-                  '\n\nu32 __system_runflags = 0;'
-                  '\nu32 __apt_appid = 0;',
+                  needle
+                  + '\n\nu32 __system_runflags = 0;'
+                  + '\nu32 __apt_appid = 0;',
                   1
               )
 
           src.write_text(code)
           PY
 
-      - name: Compile and save log
+      - name: Compile with log
         shell: bash
         run: |
           set -o pipefail
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            zaksabeast/devkitarm-rust make 2>&1 | tee v1051_compile.log
+          docker run --rm -v "$PWD:/work" -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee v106_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-5-1-main-menu-dry-run
+          name: rowlet-v10-6-dry-test
           path: out/default.3gx
           if-no-files-found: error
 
-      - name: Upload log
+      - name: Upload compile log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-5-1-compile-log
-          path: v1051_compile.log
+          name: rowlet-v10-6-compile-log
+          path: v106_compile.log
           if-no-files-found: warn
