@@ -1,5 +1,5 @@
 
-name: Build Rowlet AUTO v10.2.1
+name: Build Rowlet AUTO v10.2.2
 
 on:
   workflow_dispatch:
@@ -43,6 +43,7 @@ jobs:
           s += r'''
 
           #include <3ds.h>
+          #include "csvc.h"
           #include "common.h"
 
           static volatile u32 auto_rowlet_mask = 0;
@@ -434,10 +435,10 @@ jobs:
           replace(
               'reader_core/src/gen7/frame.rs',
               'pnp::println!("ROWLET WATCH v5");',
-              'pnp::println!("ROWLET AUTO v10.2.1");'
+              'pnp::println!("ROWLET AUTO v10.2.2");'
           )
 
-          print("Rowlet AUTO v10.2.1 patched")
+          print("Rowlet AUTO v10.2.2 patched")
           print("Input: D-pad + rehid")
           print("Mode: DRY RUN")
           print("Automatic reset: DISABLED")
@@ -455,7 +456,6 @@ jobs:
 
           if '__tdata_align' not in code:
               needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
-
               assert needle in code, 'Cannot locate rodata section'
 
               code = code.replace(
@@ -494,7 +494,6 @@ jobs:
               '__apt_appid' not in code
           ):
               needle = 'u32 __ctru_linear_heap_size = 0;'
-
               assert needle in code, 'Cannot locate heap definitions'
 
               code = code.replace(
@@ -522,7 +521,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-auto-v10-2-1-dry-run
+          name: rowlet-auto-v10-2-2-dry-run
           path: out/default.3gx
           if-no-files-found: error
 
