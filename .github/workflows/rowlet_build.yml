@@ -1,5 +1,5 @@
 
-name: Build Rowlet V10.6 V6 Input Bridge DRY RUN
+name: Build Rowlet V10.7 Compact Dpad + A DRY RUN
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
       - name: Combine V6 input with short D-pad and A test
         shell: bash
         run: |
-          cat > /tmp/v106.py <<'PY'
+          cat > /tmp/v107.py <<'PY'
           from pathlib import Path
 
           main = Path('3gx/sources/main.c')
@@ -36,188 +36,302 @@ jobs:
           def once(source, old, new, label):
               count = source.count(old)
               if count != 1:
-                  raise RuntimeError(f'{label}: expected 1 anchor, found {count}')
+                  raise RuntimeError(
+                      f'{label}: expected 1 anchor, found {count}'
+                  )
               return source.replace(old, new, 1)
 
-          # Reuse the V6 virtual input method.
-          # No background HID thread or automatic resets.
-          h = once(h, '#include "common.h"',
-                   '#include "common.h"\n#include "csvc.h"', 'csvc header')
+          # Reuse the original V6 input approach.
+          # Only D-pad Up and A are injected.
+          # No background thread or automatic resets.
+          h = once(
+              h,
+              '#include "common.h"',
+              '#include "common.h"\n#include "csvc.h"',
+              'csvc header'
+          )
+
           h += r'''
-          // V10.6: V6-style single-frame button injection.
-          // Experimental: a successful write is not proof
-          // that Ultra Sun or rehid received a button.
-          bool rowlet_v106_inject(u32 bits)
+          // V10.7 experimental virtual input injection.
+          // A write does not prove the game received the input.
+          bool rowlet_v107_inject(u32 bits)
           {
               if (!g_key_addr) return false;
+
               bits &= (KEY_A | KEY_DUP);
               if (!bits) return false;
-              volatile u32 *base = g_key_addr - (0x28 / 4);
+
+              volatile u32 *base =
+                  g_key_addr - (0x28 / 4);
+
               u32 index = base[0x10 / 4];
               if (index >= 8) return false;
-              volatile u32 *sample = base + (0x28 / 4) + index * (0x10 / 4);
-              u32 sample_pa = svcConvertVAToPA((const void *)sample, false);
+
+              volatile u32 *sample =
+                  base + (0x28 / 4)
+                  + index * (0x10 / 4);
+
+              u32 sample_pa = svcConvertVAToPA(
+                  (const void *)sample, false
+              );
+
               u32 current_pa = svcConvertVAToPA(
-                  (const void *)(base + (0x1c / 4)), false);
-              if (!sample_pa || !current_pa) return false;
-              volatile u32 *s = (volatile u32 *)(sample_pa | 0x80000000u);
-              volatile u32 *cur = (volatile u32 *)(current_pa | 0x80000000u);
+                  (const void *)(base + (0x1c / 4)),
+                  false
+              );
+
+              if (!sample_pa || !current_pa)
+                  return false;
+
+              volatile u32 *s =
+                  (volatile u32 *)(sample_pa | 0x80000000u);
+
+              volatile u32 *cur =
+                  (volatile u32 *)(current_pa | 0x80000000u);
+
               s[0] |= bits;
               s[1] |= bits;
               *cur |= bits;
+
               return true;
           }
           '''
-          d += '\nbool rowlet_v106_inject(u32 bits);\n'
+
+          d += '\nbool rowlet_v107_inject(u32 bits);\n'
 
           controller = r'''
-          // V10.6 manual, one-cycle dry run.
-          // 0 READY, 1 RELEASE, 2 UP, 3 A, 4 DONE, 5 STOP.
-          static unsigned v106_state = 0;
-          static unsigned v106_frames = 0;
-          static unsigned v106_idle = 0;
-          static unsigned v106_up_calls = 0;
-          static unsigned v106_a_calls = 0;
-          static const char *v106_error = "";
-          #define V106_TITLE 0x00040000001B5000ULL
+          // V10.7 manual, single-cycle DRY RUN.
+          //
+          // 0 READY
+          // 1 RELEASE
+          // 2 MOVING
+          // 3 PRESS A
+          // 4 DONE
+          // 5 STOP/ERROR
 
-          static void v106_set(unsigned state)
+          static unsigned v107_state = 0;
+          static unsigned v107_frames = 0;
+          static unsigned v107_idle = 0;
+          static unsigned v107_up_calls = 0;
+          static unsigned v107_a_calls = 0;
+
+          static const char *v107_error = "";
+
+          #define V107_TITLE 0x00040000001B5000ULL
+
+          static void v107_set(unsigned state)
           {
-              v106_state = state;
-              v106_frames = 0;
+              v107_state = state;
+              v107_frames = 0;
           }
 
-          static void rowlet_v106_tick(void)
+          static void rowlet_v107_tick(void)
           {
-              if (get_title_id() != V106_TITLE) return;
+              if (get_title_id() != V107_TITLE)
+                  return;
+
               const u32 keys = get_current_keys();
-              const u32 start = KEY_L | KEY_X | KEY_Y;
 
-              if (v106_state == 0) {
-                  if (keys == start) {
-                      v106_up_calls = 0;
-                      v106_a_calls = 0;
-                      v106_idle = 0;
-                      v106_set(1);
+              // NEW TRIGGER: L + R + Y
+              // No X-button activation.
+              const u32 start = KEY_L | KEY_R | KEY_Y;
+
+              if (v107_state == 0) {
+                  if (
+                      (keys & start) == start &&
+                      !(keys & KEY_X)
+                  ) {
+                      v107_up_calls = 0;
+                      v107_a_calls = 0;
+                      v107_idle = 0;
+                      v107_set(1);
                   }
+
                   return;
               }
 
-              // Physical B is the emergency stop.
+              // Physical B stops the test.
               if (keys & KEY_B) {
-                  v106_error = "MANUAL STOP";
-                  v106_set(5);
+                  v107_error = "MANUAL STOP";
+                  v107_set(5);
                   return;
               }
 
-              if (v106_state >= 4) return;
+              if (v107_state >= 4)
+                  return;
 
-              if (v106_state == 1) {
-                  v106_idle = (keys == 0) ? v106_idle + 1 : 0;
-                  if (v106_idle >= 15) v106_set(2);
-                  if (++v106_frames > 600) {
-                      v106_error = "RELEASE TIMEOUT";
-                      v106_set(5);
+              if (v107_state == 1) {
+                  // Wait for activation buttons
+                  // to be released.
+                  v107_idle =
+                      (keys == 0) ? v107_idle + 1 : 0;
+
+                  if (v107_idle >= 15) {
+                      v107_set(2);
                   }
+
+                  if (++v107_frames > 600) {
+                      v107_error = "RELEASE TIMEOUT";
+                      v107_set(5);
+                  }
+
                   return;
               }
 
-              // Ignore residual virtual A and D-pad Up.
+              // Stop on unexpected physical input.
               if ((keys & ~(KEY_DUP | KEY_A)) != 0) {
-                  v106_error = "OTHER KEY PRESSED";
-                  v106_set(5);
+                  v107_error = "OTHER KEY PRESSED";
+                  v107_set(5);
                   return;
               }
 
-              if (v106_state == 2) {
-                  // Attempt D-pad Up for 120 rendered frames.
-                  if (v106_frames < 120) {
-                      if (!rowlet_v106_inject(KEY_DUP)) {
-                          v106_error = "UP INJECT FAILED";
-                          v106_set(5);
+              if (v107_state == 2) {
+                  // Attempt D-pad Up for 120 frames.
+                  // rehid mapping is configured
+                  // on the user's console.
+
+                  if (v107_frames < 120) {
+                      if (!rowlet_v107_inject(KEY_DUP)) {
+                          v107_error = "UP INJECT FAILED";
+                          v107_set(5);
                           return;
                       }
-                      ++v106_up_calls;
+
+                      ++v107_up_calls;
                   } else {
-                      v106_set(3);
-                      return;
-                  }
-              } else if (v106_state == 3) {
-                  // 10 short A pulses, no continuous loop.
-                  if (v106_frames < 350) {
-                      if ((v106_frames % 35) < 6) {
-                          if (!rowlet_v106_inject(KEY_A)) {
-                              v106_error = "A INJECT FAILED";
-                              v106_set(5);
-                              return;
-                          }
-                          ++v106_a_calls;
-                      }
-                  } else {
-                      v106_set(4);
+                      v107_set(3);
                       return;
                   }
               }
 
-              ++v106_frames;
+              else if (v107_state == 3) {
+                  // Ten short A-button pulses.
+                  // Six frames per pulse, spaced
+                  // 35 frames apart.
+
+                  if (v107_frames < 350) {
+                      if ((v107_frames % 35) < 6) {
+                          if (!rowlet_v107_inject(KEY_A)) {
+                              v107_error = "A INJECT FAILED";
+                              v107_set(5);
+                              return;
+                          }
+
+                          ++v107_a_calls;
+                      }
+                  } else {
+                      v107_set(4);
+                      return;
+                  }
+              }
+
+              ++v107_frames;
           }
 
-          static void rowlet_v106_overlay(void)
+          static void rowlet_v107_overlay(void)
           {
-              if (get_title_id() != V106_TITLE) return;
+              if (get_title_id() != V107_TITLE)
+                  return;
 
-              const char *state = "READY L+X+Y";
-              if (v106_state == 1) state = "RELEASE BUTTONS";
-              if (v106_state == 2) state = "UP INJECTION ATTEMPT";
-              if (v106_state == 3) state = "A INJECTION ATTEMPT";
-              if (v106_state == 4) state = "DRY RUN FINISHED";
-              if (v106_state == 5) state = v106_error;
+              const char *state = "READY";
 
-              char buf[128];
-              snprintf(buf, sizeof(buf),
-                       "V10.6 DRY / NO RESET: %s", state);
-              host_print((u32)buf, strlen(buf), 0x00ffff);
+              if (v107_state == 1)
+                  state = "RELEASE";
 
-              snprintf(buf, sizeof(buf),
-                       "UP frames: %u  A frames: %u",
-                       v106_up_calls, v106_a_calls);
-              host_print((u32)buf, strlen(buf), 0x00ffff);
+              if (v107_state == 2)
+                  state = "MOVING";
+
+              if (v107_state == 3)
+                  state = "PRESS A";
+
+              if (v107_state == 4)
+                  state = "DONE";
+
+              if (v107_state == 5)
+                  state = "STOP/ERROR";
+
+              char buf[64];
+
+              // Compact four-line popup.
+              host_print(
+                  (u32)"ROWLET V10.7 DRY",
+                  16,
+                  0x00ffff
+              );
 
               host_print(
-                  (u32)"B: STOP / INPUT NOT VERIFIED",
-                  28, 0x00ffff
+                  (u32)"L+R+Y: START",
+                  12,
+                  0x00ffff
+              );
+
+              snprintf(
+                  buf,
+                  sizeof(buf),
+                  "STATE: %s",
+                  state
+              );
+
+              host_print(
+                  (u32)buf,
+                  strlen(buf),
+                  0x00ffff
+              );
+
+              snprintf(
+                  buf,
+                  sizeof(buf),
+                  "UP:%u A:%u",
+                  v107_up_calls,
+                  v107_a_calls
+              );
+
+              host_print(
+                  (u32)buf,
+                  strlen(buf),
+                  0x00ffff
               );
           }
           '''
 
           m = once(
-              m, 'void run_hook(',
+              m,
+              'void run_hook(',
               controller + '\nvoid run_hook(',
               'controller location'
           )
 
-          # Replace the original V6 diagnostic block.
-          # Show all status information on the main popup.
+          # Replace the V6 diagnostic block.
+          # Show progress on the main popup,
+          # without entering Rowlet Watch.
           hook_start = (
               '        scan_input();\n'
               '        rowlet_a_test_tick();\n'
               '        run_frame();'
           )
+
           hook_end = (
-              '        draw_to_screen(screenId, fb_a, stride, format);'
+              '        draw_to_screen('
+              'screenId, fb_a, stride, format);'
           )
 
-          if m.count(hook_start) != 1 or m.count(hook_end) != 1:
-              raise RuntimeError('Expected unique V6 overlay hook not found')
+          if (
+              m.count(hook_start) != 1
+              or m.count(hook_end) != 1
+          ):
+              raise RuntimeError(
+                  'Expected unique V6 overlay hook not found'
+              )
 
           a = m.index(hook_start)
           b = m.index(hook_end, a) + len(hook_end)
+
           m = (
               m[:a]
               + '        scan_input();\n'
-              + '        rowlet_v106_tick();\n'
+              + '        rowlet_v107_tick();\n'
               + '        run_frame();\n'
-              + '        rowlet_v106_overlay();\n'
+              + '        rowlet_v107_overlay();\n'
               + hook_end
               + m[b:]
           )
@@ -226,11 +340,14 @@ jobs:
           hid.write_text(h)
           header.write_text(d)
 
-          print('V10.6 V6-style input bridge patched')
-          print('Dry run: no automatic resets')
+          print("V10.7 patch applied")
+          print("Trigger: L + R + Y")
+          print("Movement: D-pad Up + rehid")
+          print("Virtual A: Enabled")
+          print("Reset: DISABLED")
           PY
 
-          python3 /tmp/v106.py
+          python3 /tmp/v107.py
 
       - name: Fix libctru 2.4.1 compatibility
         shell: bash
@@ -242,7 +359,11 @@ jobs:
           code = ld.read_text()
 
           if '__tdata_align' not in code:
-              needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
+              needle = (
+                  'SORT(CONSTRUCTORS)\n'
+                  '\t\t. = ALIGN(4);'
+              )
+
               assert needle in code
 
               code = code.replace(
@@ -256,16 +377,19 @@ jobs:
 
           needle = (
               '\t\t__tls_start = .;\n'
-              '\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
+              '\t\t. += + SIZEOF(.tdata) '
+              '+ SIZEOF(.tbss);'
           )
 
           if needle in code:
               code = code.replace(
                   needle,
                   '\t\t. = 8 + ABSOLUTE(ALIGN('
-                  'ABSOLUTE(. - 8), MAX(4, ALIGNOF(.tdata))));\n'
+                  'ABSOLUTE(. - 8), '
+                  'MAX(4, ALIGNOF(.tdata))));\n'
                   '\t\t__tls_start = .;\n'
-                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
+                  '\t\t. += SIZEOF(.tdata) '
+                  '+ SIZEOF(.tbss);',
                   1
               )
 
@@ -274,8 +398,14 @@ jobs:
           src = Path('3gx/sources/main.c')
           code = src.read_text()
 
-          if '__system_runflags' not in code or '__apt_appid' not in code:
-              needle = 'u32 __ctru_linear_heap_size = 0;'
+          if (
+              '__system_runflags' not in code
+              or '__apt_appid' not in code
+          ):
+              needle = (
+                  'u32 __ctru_linear_heap_size = 0;'
+              )
+
               assert needle in code
 
               code = code.replace(
@@ -293,14 +423,17 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          docker run --rm -v "$PWD:/work" -w /work \
-            zaksabeast/devkitarm-rust make 2>&1 | tee v106_compile.log
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            zaksabeast/devkitarm-rust make \
+            2>&1 | tee v107_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-6-dry-test
+          name: rowlet-v10-7-dry-test
           path: out/default.3gx
           if-no-files-found: error
 
@@ -308,6 +441,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v10-6-compile-log
-          path: v106_compile.log
+          name: rowlet-v10-7-compile-log
+          path: v107_compile.log
           if-no-files-found: warn
