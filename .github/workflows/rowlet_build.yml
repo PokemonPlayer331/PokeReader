@@ -1,266 +1,601 @@
-/**
- * Spear matching the provided photo, with a 90° pivoting head.
- * Compatible with https://jscad.app and OpenJSCAD v2.
- *
- * Use the "Pivot Angle" parameter to toggle the head between
- * aligned (0°) and folded (90°). The hinge is designed for
- * 3D printing + a short pin (or M3 bolt).
- *
- * Units: mm. Overall length ~ 480 mm (scale as needed).
- */
 
-const jscad = require('@jscad/modeling')
-const { cylinder, cuboid, polygon, roundedCuboid } = jscad.primitives
-const { extrudeLinear } = jscad.extrusions
-const { union, subtract, intersect } = jscad.booleans
-const { translate, rotate, rotateX, rotateY, rotateZ, scale, mirror } = jscad.transforms
-const { degToRad } = jscad.utils
-const { colorize } = jscad.colors
+# V13.2: automatic non-shiny resets, A spam, nickname START->A workaround.
+name: Build Rowlet V13.2 Nickname + Auto-Reset
 
-// ---------------------------------------------------------------------------
-// Parameters (shown as controls in the JSCAD UI)
-// ---------------------------------------------------------------------------
-const getParameterDefinitions = () => [
-  { name: 'pivotAngle', type: 'number', initial: 0, min: 0, max: 90, step: 1, caption: 'Pivot Angle (°)' },
-  { name: 'scale', type: 'number', initial: 1.0, min: 0.3, max: 2.0, step: 0.05, caption: 'Overall Scale' },
-  { name: 'showPin', type: 'choice', caption: 'Show Pin', values: [0, 1], captions: ['No', 'Yes'], initial: 1 },
-  { name: 'separateParts', type: 'choice', caption: 'Layout for Printing', values: [0, 1], captions: ['Assembled', 'Separated'], initial: 0 }
-]
+'on':
+  workflow_dispatch:
 
-// ---------------------------------------------------------------------------
-// Tunable dimensions (mm) – proportions matched to the photo
-// ---------------------------------------------------------------------------
-const DIM = {
-  // Shaft
-  shaftLength: 340,
-  shaftRadius: 4.2,
+permissions:
+  contents: read
 
-  // Handle / grip wrap
-  handleLength: 85,
-  handleTopRadius: 11,
-  handleBottomRadius: 16,
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  // Head / blade
-  headLength: 78,
-  headThickness: 3.2,
-  holeRadius: 3.8,          // the circular hole visible in the photo
+      - name: Apply V5 decoded Rowlet watcher
+        run: python3 patch/apply_patch.py .
 
-  // Hinge
-  hingePinRadius: 1.6,      // ~M3
-  hingeClearance: 0.25,     // FDM-friendly
-  hingeEarThickness: 3.5,
-  hingeEarSpacing: 7.5,     // distance between the two outer ears
-  hingeTabThickness: 3.0
-}
+      - name: Apply V6 working A-input bridge
+        run: python3 patch/apply_input_test.py .
 
-// ---------------------------------------------------------------------------
-// Helper: create the distinctive blade profile (matches photo silhouette)
-// ---------------------------------------------------------------------------
-const createBladeProfile = () => {
-  // 2-D outline of the spearhead (XZ plane later).  
-  // Points ordered clockwise, looking from +Y.
-  // The left side has the longer downward barb that appears in the photo.
-  const points = [
-    [0, 0],                 // tip
-    [6, 18],
-    [11, 32],
-    [13, 42],               // widest upper section
-    [12, 52],
-    [9, 58],
-    [4, 62],
-    // lower left barb (the characteristic wing visible in photo)
-    [8, 68],
-    [14, 74],
-    [7, 78],
-    [0, 72],
-    // right side of lower section
-    [-3, 68],
-    [-6, 58],
-    [-10, 48],
-    [-12, 38],
-    [-11, 28],
-    [-7, 16],
-    [-3, 6]
-  ]
-  return polygon({ points })
-}
+      - name: Replace V6 test with V12.1 A pulses and shiny-only status
+        shell: bash
+        run: |
+          cat > /tmp/rowlet_v12_1_patch.py <<'PY'
+          #!/usr/bin/env python3
+          """V12.1 A pulses and Rowlet Watch status, applied AFTER repo V5 + V6 patches."""
+          from pathlib import Path
 
-// ---------------------------------------------------------------------------
-// Spear head (blade + hinge tab)
-// ---------------------------------------------------------------------------
-const createHead = (params) => {
-  const t = DIM.headThickness
-  const blade = extrudeLinear({ height: t }, createBladeProfile())
+          main = Path('3gx/sources/main.c')
+          hid = Path('3gx/sources/hid.c')
+          hdr = Path('3gx/includes/hid.h')
+          frame = Path('reader_core/src/gen7/frame.rs')
+          for p in (main, hid, hdr, frame):
+              if not p.is_file():
+                  raise SystemExit(f'V12.1 missing source: {p}')
+          m, h, d, f = (p.read_text() for p in (main, hid, hdr, frame))
 
-  // Center the blade on its thickness and move so base sits near origin
-  let head = translate([0, -t / 2, -DIM.headLength], blade)
+          def rep(s, a, b, label):
+              n=s.count(a)
+              if n!=1:
+                  raise SystemExit(f'V12.1 {label}: expected one anchor, found {n}; stopped before editing')
+              return s.replace(a,b,1)
 
-  // Circular hole (visible in photo)
-  const hole = translate([0, 0, -42], 
-    rotateX(degToRad(90), cylinder({ radius: DIM.holeRadius, height: t + 2, segments: 24 }))
-  )
-  head = subtract(head, hole)
+          # V6 controller really starts with exactly this marker in apply_input_test.py.
+          start = '// ROWLET_V6_INPUT_TEST\n\nstatic unsigned int rowlet_a_test_state'
+          end = 'void run_hook('
+          if m.count(start) != 1 or m.count(end) != 1:
+              raise SystemExit('V12.1 actual V6 controller anchors missing; stopped before editing')
+          a, b = m.index(start), m.index(end)
+          if a >= b:
+              raise SystemExit('V12.1 V6 controller order invalid')
 
-  // Hinge tab that fits between the shaft ears
-  const tabW = DIM.hingeEarSpacing - 2 * DIM.hingeClearance
-  const tab = translate(
-    [0, -DIM.hingeTabThickness / 2, 0],
-    cuboid({
-      size: [18, DIM.hingeTabThickness, 14],
-      center: [0, 0, 7]
-    })
-  )
-  // Pin hole in the tab
-  const tabHole = translate([0, 0, 7],
-    rotateX(degToRad(90), cylinder({
-      radius: DIM.hingePinRadius + DIM.hingeClearance,
-      height: DIM.hingeTabThickness + 2,
-      segments: 20
-    }))
-  )
-  const tabWithHole = subtract(tab, tabHole)
+          controller = r'''// ROWLET_V12_1: virtual A only; no injected motion, no reset.
+          #define ROWLET_V12_TITLE 0x00040000001B5000ULL
+          #define ROWLET_V12_TIMEOUT 10800u
+          static volatile u32 v12_phase = 0;
+          static u32 v12_state = 0; /* 0 ready, 1 release trigger, 2 pulses, 3 stop */
+          static u32 v12_frame = 0;
+          static u32 v12_release = 0;
 
-  head = union(head, tabWithHole)
-  return head
-}
+          void rowlet_v12_report(u32 phase) { v12_phase = phase; }
 
-// ---------------------------------------------------------------------------
-// Shaft + handle + hinge ears
-// ---------------------------------------------------------------------------
-const createShaft = () => {
-  // Main thin shaft
-  const shaft = cylinder({
-    radius: DIM.shaftRadius,
-    height: DIM.shaftLength,
-    center: [0, 0, DIM.shaftLength / 2],
-    segments: 24
-  })
+          static void rowlet_v12_tick(void)
+          {
+              if (get_title_id() != ROWLET_V12_TITLE) return;
+              const u32 keys = get_current_keys();
+              const u32 trigger = KEY_L | KEY_R | KEY_Y;
+              if ((keys & KEY_B) || v12_phase >= 4) {
+                  if (v12_state == 2) rowlet_try_release_a_frame();
+                  v12_state = 3;
+                  return;
+              }
+              if (v12_state == 0) {
+                  if ((keys & trigger) == trigger) {
+                      v12_state = 1;
+                      v12_frame = 0;
+                      v12_release = 0;
+                  }
+                  return;
+              }
+              if (v12_state == 1) {
+                  if ((keys & trigger) == 0) {
+                      if (++v12_release >= 8) {
+                          v12_state = 2;
+                          v12_frame = 0;
+                      }
+                  } else {
+                      v12_release = 0;
+                  }
+                  if (++v12_frame > 600) v12_state = 3;
+                  return;
+              }
+              if (v12_state != 2) return;
+              if (v12_frame++ >= ROWLET_V12_TIMEOUT) {
+                  rowlet_try_release_a_frame();
+                  v12_state = 3;
+                  return;
+              }
+              /* Two ON frames, four OFF frames; ~10 distinct A presses/second. */
+              bool ok = ((v12_frame % 6u) < 2u) ?
+                  rowlet_try_inject_a_frame() : rowlet_try_release_a_frame();
+              if (!ok) v12_state = 3;
+          }
 
-  // Tapered handle (suggests the wrapped grip)
-  const handle = translate([0, 0, -DIM.handleLength / 2],
-    cylinder({
-      radius: DIM.handleBottomRadius,
-      height: DIM.handleLength,
-      center: [0, 0, 0],
-      segments: 28
-    })
-  )
-  // Slight taper by intersecting with a cone-like shape is overkill;
-  // we approximate with a second overlapping cylinder for a stepped look
-  const handleTop = translate([0, 0, -8],
-    cylinder({
-      radius: DIM.handleTopRadius,
-      height: 20,
-      center: [0, 0, 0],
-      segments: 28
-    })
-  )
+          '''
+          m = m[:a] + controller + m[b:]
 
-  // Decorative rings that suggest wrapping
-  const rings = []
-  for (let i = 0; i < 6; i++) {
-    const z = -12 - i * 12
-    rings.push(
-      translate([0, 0, z],
-        cylinder({
-          radius: DIM.handleBottomRadius + 0.8 - i * 0.15,
-          height: 3.5,
-          center: [0, 0, 0],
-          segments: 28
-        })
-      )
-    )
-  }
+          # Patch the actual V6 hook block. The V6 patcher uses a multiline display
+          # whose formatting differs from the older v12 template. Restrict to run_hook.
+          run = m.index('void run_hook(')
+          start_block = m.index('        scan_input();\n        rowlet_a_test_tick();\n        run_frame();',run)
+          end_statement = '        draw_to_screen(screenId, fb_a, stride, format);'
+          end_block = m.index(end_statement,start_block)+len(end_statement)
+          old_block = m[start_block:end_block]
+          if 'A TEST READY: L+X+Y' not in old_block or old_block.count('draw_to_screen(')!=1:
+              raise SystemExit('V12.1 V6 overlay has unexpected structure; stopped before editing')
+          m = m[:start_block]+'''        scan_input();
+                  run_frame();
+                  rowlet_v12_tick();
+                  draw_to_screen(screenId, fb_a, stride, format);'''+m[end_block:]
 
-  // Hinge ears at the top of the shaft
-  const earHeight = 16
-  const ear = cuboid({
-    size: [16, DIM.hingeEarThickness, earHeight],
-    center: [0, 0, earHeight / 2]
-  })
-  // Pin holes in ears
-  const earHole = translate([0, 0, 7],
-    rotateX(degToRad(90), cylinder({
-      radius: DIM.hingePinRadius + DIM.hingeClearance * 0.6,
-      height: DIM.hingeEarThickness + 2,
-      segments: 20
-    }))
-  )
-  const earWithHole = subtract(ear, earHole)
+          # Explicitly clear injected A between pulses, so the game sees new key edges.
+          # Same mapping and checks as the working V6 injection helper.
+          release = r'''
+          // ROWLET_V12_1: release the virtual A in the current HID sample.
+          bool rowlet_try_release_a_frame(void)
+          {
+              if (!g_key_addr) return false;
+              volatile u32 *base = g_key_addr - (0x28 / 4);
+              u32 index = base[0x10 / 4];
+              if (index >= 8) return false;
+              volatile u32 *sample = base + (0x28 / 4) + index * (0x10 / 4);
+              u32 sample_pa = svcConvertVAToPA((const void *)sample, false);
+              u32 current_pa = svcConvertVAToPA((const void *)(base + (0x1c / 4)), false);
+              if (!sample_pa || !current_pa) return false;
+              volatile u32 *s = (volatile u32 *)(sample_pa | 0x80000000u);
+              volatile u32 *cur = (volatile u32 *)(current_pa | 0x80000000u);
+              s[0] &= ~KEY_A;
+              s[1] &= ~KEY_A;
+              *cur &= ~KEY_A;
+              return true;
+          }
+          '''
+          if h.count('bool rowlet_try_inject_a_frame(void)')!=1:
+              raise SystemExit('V12.1 V6 HID injection helper missing; stopped before editing')
+          h += release
+          if d.count('bool rowlet_try_inject_a_frame(void);')!=1:
+              raise SystemExit('V12.1 V6 HID header missing; stopped before editing')
+          d += '\n// ROWLET_V12_1\nbool rowlet_try_release_a_frame(void);\n'
 
-  const leftEar = translate([0, -DIM.hingeEarSpacing / 2, DIM.shaftLength], earWithHole)
-  const rightEar = translate([0,  DIM.hingeEarSpacing / 2, DIM.shaftLength], earWithHole)
+          # V5 watcher always ticks, even when overlay is hidden. Report its phase
+          # immediately after that tick, so we never show a guessed shiny value.
+          f = rep(f, 'use super::rowlet_watch::{Sample, Watch};',
+                  'use super::rowlet_watch::{Sample, Watch, Phase};','Rust phase import')
+          status = '''    if is_ultra_sun {
+                  let phase = match state.rowlet_watch.phase {
+                      Phase::Standby => 0,
+                      Phase::WaitRowlet => 1,
+                      Phase::Verify => 2,
+                      Phase::Reverify => 3,
+                      Phase::Normal => 4,
+                      Phase::Shiny => 5,
+                      Phase::Error => 6,
+                  };
+                  extern "C" { fn rowlet_v12_report(phase: u32); }
+                  unsafe { rowlet_v12_report(phase); }
+                  let label = match state.rowlet_watch.phase {
+                      Phase::Standby | Phase::WaitRowlet => "ROWLET: WAITING",
+                      Phase::Verify | Phase::Reverify => "ROWLET: CHECKING",
+                      Phase::Normal => "ROWLET: NOT SHINY",
+                      Phase::Shiny => "ROWLET: SHINY!",
+                      Phase::Error => "ROWLET: ERROR",
+                  };
+                  pnp::println!("{}", label);
+                  return;
+              }
 
-  // Small reinforcing collar under the ears
-  const collar = translate([0, 0, DIM.shaftLength - 3],
-    cylinder({
-      radius: DIM.shaftRadius + 1.8,
-      height: 8,
-      center: [0, 0, 0],
-      segments: 24
-    })
-  )
+          '''
+          # Watcher original insertion comes directly from patch/apply_patch.py.
+          watcher_end = '            shiny: mon.is_shiny(),\n        });\n    }\n\n'
+          f = rep(f, watcher_end, watcher_end+status, 'Rust V5 watcher tick')
 
-  return union(shaft, handle, handleTop, ...rings, leftEar, rightEar, collar)
-}
+          # Write only when all checks above succeeded.
+          for p, value in ((main,m),(hid,h),(hdr,d),(frame,f)):
+              p.write_text(value)
+          print('V12.1 installed from V5 + V6, one-line shiny status, distinct A pulses.')
+          PY
+          python3 /tmp/rowlet_v12_1_patch.py
 
-// ---------------------------------------------------------------------------
-// Simple pin
-// ---------------------------------------------------------------------------
-const createPin = () => {
-  const pinLen = DIM.hingeEarSpacing + 2 * DIM.hingeEarThickness + 4
-  return cylinder({
-    radius: DIM.hingePinRadius,
-    height: pinLen,
-    center: [0, 0, 0],
-    segments: 16
-  })
-}
+      - name: Install V13.1 reset loop
+        shell: bash
+        run: |
+          cat > /tmp/rowlet_v13_addon.py <<'PY'
+          #!/usr/bin/env python3
+          """Apply a V13.1 auto-reset loop to a clean V12.1-patched checkout.
+          No reset without the existing decoded, stable, validated Rowlet Watch Normal phase.
+          """
+          from pathlib import Path
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-const main = (params) => {
-  const angle = degToRad(params.pivotAngle || 0)
-  const sc = params.scale || 1.0
+          main=Path('3gx/sources/main.c')
+          hid=Path('3gx/sources/hid.c')
+          hdr=Path('3gx/includes/hid.h')
+          frame=Path('reader_core/src/gen7/frame.rs')
+          paths=(main,hid,hdr,frame)
+          m,h,d,f=(p.read_text() for p in paths)
 
-  let head = createHead(params)
-  let shaft = createShaft()
-  let pin = createPin()
+          def repl(s,a,b,label):
+              n=s.count(a)
+              if n!=1:
+                  raise SystemExit(f'V13 {label}: expected one exact anchor; found {n}; no changes written')
+              return s.replace(a,b,1)
 
-  // Position the head so its hinge hole is at the pivot point
-  // Pivot is at the top of the shaft, offset in Z by 7 mm into the ears
-  const pivotZ = DIM.shaftLength + 7
+          start='// ROWLET_V12_1: virtual A only; no injected motion, no reset.'
+          end='void run_hook('
+          if m.count(start)!=1 or m.count(end)!=1 or m.index(start)>=m.index(end):
+              raise SystemExit('V13 expected V12.1 controller missing; no changes written')
+          a,b=m.index(start),m.index(end)
+          ctrl=r'''// ROWLET_V13: experimental A-spam / nonshiny-only reset loop.
+          #define ROWLET_V13_TITLE 0x00040000001B5000ULL
+          /* No injected movement; reset is L+R+START, never X. */
+          static volatile u32 v13_phase = 0; // V5 verified phase reported by Rust
+          static u32 v13_mode = 0; // 0 ready 1 trigger-release 2 A 3 reset 4 reload 5 stop
+          static u32 v13_frame = 0;
+          static u32 v13_released = 0;
+          static u32 v13_boot_frames = 0;
+          static u32 v13_resets = 0;
+          static u32 v13_missing_hid = 0;
+          static u32 v13_reset_ok_frames = 0;
 
-  // Rotate head around the Y axis (the pin axis)
-  head = translate([0, 0, -7], head)          // move hinge hole to origin
-  head = rotateY(angle, head)
-  head = translate([0, 0, pivotZ], head)
+          void rowlet_v13_report(u32 phase) { v13_phase = phase; }
+          u32 rowlet_v13_reset_sent(void) { return v13_mode == 4 ? 1u : 0u; }
 
-  // Position pin
-  pin = rotateX(degToRad(90), pin)
-  pin = translate([0, 0, pivotZ], pin)
+          static void rowlet_v13_halt(void)
+          {
+              rowlet_try_release_a_frame();
+              rowlet_try_soft_reset_frame(false);
+              v13_mode = 5;
+          }
 
-  // Layout for printing
-  if (params.separateParts) {
-    // Lay everything flat and spaced for easy slicing
-    head = translate([60, 0, 0], rotateX(degToRad(-90), translate([0, 0, -pivotZ], head)))
-    shaft = rotateX(degToRad(-90), shaft)
-    pin = translate([-40, 0, 0], pin)
-  }
+          static void rowlet_v13_a_pulse(void)
+          {
+              bool down = (v13_frame % 6u) < 2u; // ~10 A taps / second
+              bool ok = down ? rowlet_try_inject_a_frame() : rowlet_try_release_a_frame();
+              // During title/reload HID may temporarily be unavailable; retry for 10 sec.
+              if (!ok) {
+                  if (++v13_missing_hid > 600) rowlet_v13_halt();
+              } else {
+                  v13_missing_hid = 0;
+              }
+              v13_frame++;
+          }
 
-  // Apply overall scale
-  const parts = [head, shaft]
-  if (params.showPin) parts.push(pin)
+          static void rowlet_v13_tick(void)
+          {
+              if (get_title_id() != ROWLET_V13_TITLE) return;
+              const u32 keys = get_current_keys();
+              const u32 trigger = KEY_L | KEY_R | KEY_Y; // X is NEVER injected
 
-  const scaled = parts.map(p => scale([sc, sc, sc], p))
+              if (keys & KEY_B) { rowlet_v13_halt(); return; }
+              if (v13_mode == 5) return;
+              if (v13_phase == 5 || v13_phase == 6) { // SHINY or ERROR
+                  rowlet_v13_halt();
+                  return;
+              }
 
-  // Optional subtle coloring for the UI (does not affect STL)
-  return [
-    colorize([0.35, 0.28, 0.22], scaled[0]),   // head – darker
-    colorize([0.40, 0.32, 0.25], scaled[1]),   // shaft
-    ...(scaled[2] ? [colorize([0.55, 0.55, 0.55], scaled[2])] : [])
-  ]
-}
+              if (v13_mode == 0) {
+                  // Start manually with L+R+Y or auto-start after boot/reload.
+                  // Auto-start is needed if an in-game reset recreates the plugin process.
+                  if ((keys & trigger) == trigger) {
+                      v13_mode = 1; v13_released = 0; v13_frame = 0;
+                  } else if (++v13_boot_frames > 240) { // initial ~4 sec grace period
+                      v13_mode = 2; v13_frame = 0;
+                  }
+                  return;
+              }
+              if (v13_mode == 1) {
+                  if ((keys & trigger) == 0) {
+                      if (++v13_released >= 8) { v13_mode = 2; v13_frame = 0; }
+                  } else {
+                      v13_released = 0;
+                  }
+                  if (++v13_frame > 600) rowlet_v13_halt();
+                  return;
+              }
+              if (v13_mode == 2) {
+                  // This is the ONLY condition that authorizes a reset:
+                  // V5 Rowlet Watch confirmed stable valid NON-SHINY Rowlet (phase 4).
+                  if (v13_phase == 4) {
+                      rowlet_try_release_a_frame();
+                      v13_mode = 3; v13_frame = 0;
+                      v13_missing_hid = 0; v13_reset_ok_frames = 0;
+                      return;
+                  }
+                  if (v13_frame > (60u * 240u)) { // 4-minute encounter timeout
+                      rowlet_v13_halt();
+                      return;
+                  }
+                  rowlet_v13_a_pulse();
+                  return;
+              }
+              if (v13_mode == 3) {
+                  // Never press A while attempting a reset.
+                  rowlet_try_release_a_frame();
+                  bool ok = rowlet_try_soft_reset_frame(true);
+                  v13_frame++;
+                  // HID pointer can disappear while the game reloads.
+                  // Only treat a disappearing pointer as a possible reload if
+                  // we actually injected the chord for at least 8 frames.
+                  if (ok) v13_reset_ok_frames++;
+                  if (!ok && v13_reset_ok_frames < 8u) {
+                      rowlet_v13_halt();
+                      return;
+                  }
+                  if (v13_frame >= 28u || (!ok && v13_reset_ok_frames >= 8u)) {
+                      rowlet_try_soft_reset_frame(false);
+                      v13_mode = 4; v13_frame = 0; v13_missing_hid = 0;
+                      v13_resets++;
+                  }
+                  return;
+              }
+              if (v13_mode == 4) {
+                  // Never reset twice without an entirely new empty-slot -> Rowlet cycle.
+                  // Rust re-arms the watcher only after verified post-reset empty slot 1.
+                  if (v13_phase == 1 || v13_phase == 2 || v13_phase == 3) {
+                      v13_mode = 2; v13_frame = 0;
+                      v13_missing_hid = 0;
+                  } else if (v13_frame > (60u * 100u)) { // reload failed; no more resets
+                      rowlet_v13_halt();
+                      return;
+                  }
+                  rowlet_try_soft_reset_frame(false);
+                  rowlet_v13_a_pulse();
+                  return;
+              }
+          }
 
-module.exports = { main, getParameterDefinitions }
+          '''
+          m=m[:a]+ctrl+m[b:]
+          m=repl(m,'        rowlet_v12_tick();','        rowlet_v13_tick();','C hook entry')
+
+          # Shared HID bridge inherits V6 validated addressing; only new operation is key mask.
+          helper=r'''
+          // ROWLET_V13: apply/release Ultra Sun's L+R+START soft reset chord.
+          // Never write X and never press the combination unless the C state machine
+          // received the verified Phase::Normal from Rowlet Watch.
+          bool rowlet_try_soft_reset_frame(bool down)
+          {
+              if (!g_key_addr) return false;
+              volatile u32 *base = g_key_addr - (0x28 / 4);
+              u32 index = base[0x10 / 4];
+              if (index >= 8) return false;
+              volatile u32 *sample = base + (0x28 / 4) + index * (0x10 / 4);
+              u32 sample_pa = svcConvertVAToPA((const void *)sample, false);
+              u32 current_pa = svcConvertVAToPA((const void *)(base + (0x1c / 4)), false);
+              if (!sample_pa || !current_pa) return false;
+              volatile u32 *s = (volatile u32 *)(sample_pa | 0x80000000u);
+              volatile u32 *cur = (volatile u32 *)(current_pa | 0x80000000u);
+              const u32 mask = KEY_L | KEY_R | KEY_START;
+              if (down) {
+                  s[0] = (s[0] & ~KEY_A) | mask;
+                  s[1] = (s[1] & ~KEY_A) | mask;
+                  *cur = (*cur & ~KEY_A) | mask;
+              } else {
+                  s[0] &= ~mask;
+                  s[1] &= ~mask;
+                  *cur &= ~mask;
+              }
+              return true;
+          }
+          '''
+          if h.count('bool rowlet_try_release_a_frame(void)') != 1:
+              raise SystemExit('V13 expects working V12.1 A release bridge')
+          h+=helper
+          d+='\n// ROWLET_V13\nbool rowlet_try_soft_reset_frame(bool down);\n'
+
+          # Re-arm only AFTER C has sent reset, and the trainer TSV + slot-one-empty
+          # observations are stable for 90 consecutive frames. At other times V5's
+          # fail-closed Normal/Shiny/Error latches are preserved.
+          f=repl(f,'    rowlet_watch: Watch,','    rowlet_watch: Watch,\n    rowlet_v13_rearm_frames: u16,','rearm field')
+          f=repl(f,'        rowlet_watch: Watch::new(),','        rowlet_watch: Watch::new(),\n        rowlet_v13_rearm_frames: 0,','rearm initialization')
+          f=repl(f,'extern "C" { fn rowlet_v12_report(phase: u32); }',
+                 'extern "C" { fn rowlet_v13_report(phase: u32); }',
+                 'Rust FFI declaration')
+          f=repl(f,'unsafe { rowlet_v12_report(phase); }','unsafe { rowlet_v13_report(phase); }','Rust FFI report')
+          needle='''    if is_ultra_sun {
+                  let phase = match state.rowlet_watch.phase {'''
+          replacement='''    if is_ultra_sun {
+                  // V5's earlier watcher block had its own local 'mon'. Read
+                  // a fresh slot-one record here: the earlier binding is out
+                  // of scope, and the build must not refer to it.
+                  let mon = reader.party_pkm(0);
+                  // Re-arm ONLY after this plugin has issued the reset chord and
+                  // we've seen a stable original-save trainer ID with empty slot 1.
+                  extern "C" { fn rowlet_v13_reset_sent() -> u32; }
+                  if state.rowlet_watch.phase == Phase::Normal &&
+                     unsafe { rowlet_v13_reset_sent() } != 0 {
+                      if reader.tsv() == super::rowlet_watch::TSV && mon.species() == 0 {
+                          state.rowlet_v13_rearm_frames = state.rowlet_v13_rearm_frames.saturating_add(1);
+                          if state.rowlet_v13_rearm_frames >= 90 {
+                              state.rowlet_watch = Watch::new();
+                              state.rowlet_v13_rearm_frames = 0;
+                          }
+                      } else {
+                          state.rowlet_v13_rearm_frames = 0;
+                      }
+                  }
+                  let phase = match state.rowlet_watch.phase {'''
+          f=repl(f,needle,replacement,'Rust guarded re-arm logic')
+          # After the old latch clears, C will see Phase::Standby 0; only then re-arm in
+          # Rust's existing V5 watcher, requiring another 30 stable empty frames.
+
+          # Avoid introducing report display complexity; label remains one Rowlet line.
+          for p,value in zip(paths,(m,h,d,f)):
+              p.write_text(value)
+          print('V13.1 installed: auto A, non-shiny-only L+R+START reset, 90-frame rearm guard.')
+          PY
+          python3 /tmp/rowlet_v13_addon.py
+
+      - name: V13.2 nickname keyboard START then A workaround
+        shell: bash
+        run: |
+          cat > /tmp/rowlet_v13_2_nickname.py <<'PY'
+          #! /usr/bin/env python3
+          # V13.2: periodically send START then A while awaiting a new Rowlet.
+          # This is NOT a nickname-screen detector. START moves focus to End
+          # on the nickname keyboard; the next A accepts it.
+          # The reset authorization from V13.1 remains unchanged.
+          from pathlib import Path
+          main=Path('3gx/sources/main.c')
+          hid=Path('3gx/sources/hid.c')
+          hdr=Path('3gx/includes/hid.h')
+          m,h,d = main.read_text(),hid.read_text(),hdr.read_text()
+          old='''static void rowlet_v13_a_pulse(void)
+          {
+              bool down = (v13_frame % 6u) < 2u;
+              bool ok = down ? rowlet_try_inject_a_frame() : rowlet_try_release_a_frame();
+              if (!ok) {
+                  if (++v13_missing_hid > 600) rowlet_v13_halt();
+              } else {
+                  v13_missing_hid = 0;
+              }
+              v13_frame++;
+          }'''
+          new='''static void rowlet_v13_a_pulse(void)
+          {
+              // While looking for a newly generated starter, try START -> A
+              // every ~2 seconds beginning 3 seconds after A-spam starts.
+              // On the nickname keyboard START selects End; A accepts it.
+              // This avoids relying on a guessed keyboard RAM address.
+              bool ok;
+              u32 step = v13_frame >= 180u ? (v13_frame - 180u) % 120u : 100u;
+              if (v13_phase == 1 && step < 4u) {
+                  // START down, A up: never L+R, and never X.
+                  ok = rowlet_try_release_a_frame();
+                  if (ok) ok = rowlet_try_nickname_start_frame(true);
+              } else if (v13_phase == 1 && step < 6u) {
+                  // Release START so the game sees a distinct next key press.
+                  ok = rowlet_try_nickname_start_frame(false);
+                  if (ok) ok = rowlet_try_release_a_frame();
+              } else if (v13_phase == 1 && step < 10u) {
+                  ok = rowlet_try_nickname_start_frame(false);
+                  if (ok) ok = rowlet_try_inject_a_frame();
+              } else {
+                  // Clear an old START bit before resuming V13.1 A pulses.
+                  ok = rowlet_try_nickname_start_frame(false);
+                  if (ok) {
+                      bool down = (v13_frame % 6u) < 2u;
+                      ok = down ? rowlet_try_inject_a_frame() : rowlet_try_release_a_frame();
+                  }
+              }
+              if (!ok) {
+                  if (++v13_missing_hid > 600) rowlet_v13_halt();
+              } else {
+                  v13_missing_hid = 0;
+              }
+              v13_frame++;
+          }'''
+          first='static void rowlet_v13_a_pulse(void)'
+          after='static void rowlet_v13_tick(void)'
+          if m.count(first)!=1 or m.count(after)!=1:
+              raise SystemExit('V13.2 expected V13.1 controller anchors absent')
+          begin=m.index(first)
+          end=m.index(after,begin)
+          previous=m[begin:end]
+          if 'v13_frame % 6u' not in previous or 'rowlet_try_inject_a_frame()' not in previous:
+              raise SystemExit('V13.2 V13.1 A routine unexpectedly changed')
+          m=m[:begin]+new+'\n\n'+m[end:]
+          helper=r'''
+          // V13.2: inject START alone, never L+R+START. No analog writes.
+          bool rowlet_try_nickname_start_frame(bool down)
+          {
+              if (!g_key_addr) return false;
+              volatile u32 *base = g_key_addr - (0x28 / 4);
+              u32 index = base[0x10 / 4];
+              if (index >= 8) return false;
+              volatile u32 *sample = base + (0x28 / 4) + index * (0x10 / 4);
+              u32 sample_pa = svcConvertVAToPA((const void *)sample, false);
+              u32 current_pa = svcConvertVAToPA((const void *)(base + (0x1c / 4)), false);
+              if (!sample_pa || !current_pa) return false;
+              volatile u32 *s = (volatile u32 *)(sample_pa | 0x80000000u);
+              volatile u32 *cur = (volatile u32 *)(current_pa | 0x80000000u);
+              if (down) {
+                  s[0] = (s[0] & ~KEY_A) | KEY_START;
+                  s[1] = (s[1] & ~KEY_A) | KEY_START;
+                  *cur = (*cur & ~KEY_A) | KEY_START;
+              } else {
+                  s[0] &= ~KEY_START;
+                  s[1] &= ~KEY_START;
+                  *cur &= ~KEY_START;
+              }
+              return true;
+          }
+          '''
+          if h.count('bool rowlet_try_soft_reset_frame(bool down)')!=1:
+              raise SystemExit('V13.2 reset bridge missing')
+          h += helper
+          d += '\n// V13.2 standalone nickname-keyboard START pulse\nbool rowlet_try_nickname_start_frame(bool down);\n'
+          # Important safety: no automatic inputs after SHINY or ERROR, and
+          # preserve existing guarded reset/re-arm logic verbatim.
+          assert 'if (v13_phase == 5 || v13_phase == 6)' in m
+          assert 'if (v13_phase == 4)' in m
+          assert 'rowlet_v13_reset_sent' in m
+          main.write_text(m)
+          hid.write_text(h)
+          hdr.write_text(d)
+          print('V13.2 added START -> A nickname workaround; reset gate unchanged.')
+          PY
+          python3 /tmp/rowlet_v13_2_nickname.py
+
+      - name: Fix toolchain linker compatibility
+        shell: bash
+        run: |
+          cat > /tmp/rowlet_v12_compat.py <<'PY'
+          from pathlib import Path
+          ld = Path('3gx/3gx.ld')
+          s = ld.read_text()
+          if '__tdata_align' not in s:
+              needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
+              if needle not in s:
+                  raise RuntimeError('Linker __tdata_align anchor absent')
+              s = s.replace(needle,
+                            needle + '\n\t\t__tdata_align = .;\n\t\tLONG (ALIGNOF(.tdata));\n\t\t. = ALIGN(4);', 1)
+          needle = '\t\t__tls_start = .;\n\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
+          if needle in s:
+              s = s.replace(needle,
+                            '\t\t. = 8 + ABSOLUTE(ALIGN(ABSOLUTE(. - 8), MAX(4, ALIGNOF(.tdata))));\n'
+                            '\t\t__tls_start = .;\n\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);', 1)
+          ld.write_text(s)
+          p = Path('3gx/sources/main.c')
+          s = p.read_text()
+          if '__system_runflags' not in s or '__apt_appid' not in s:
+              needle = 'u32 __ctru_linear_heap_size = 0;'
+              if needle not in s:
+                  raise RuntimeError('libctru definitions anchor absent')
+              s = s.replace(needle,
+                            needle + '\n\nu32 __system_runflags = 0;\nu32 __apt_appid = 0;', 1)
+          p.write_text(s)
+          PY
+          python3 /tmp/rowlet_v12_compat.py
+
+      - name: Verify installed code
+        shell: bash
+        run: |
+          grep -Fq 'rowlet_v13_tick();' 3gx/sources/main.c
+          grep -Fq 'rowlet_try_soft_reset_frame' 3gx/sources/hid.c
+          grep -Fq 'ROWLET: SHINY!' reader_core/src/gen7/frame.rs
+          grep -Fq 'ROWLET: NOT SHINY' reader_core/src/gen7/frame.rs
+          grep -Fq 'rowlet_v13_reset_sent' reader_core/src/gen7/frame.rs
+          grep -Fq 'rowlet_try_nickname_start_frame(true)' 3gx/sources/main.c
+          grep -Fq 'rowlet_try_nickname_start_frame' 3gx/sources/hid.c
+          grep -Fq 'let mon = reader.party_pkm(0);' reader_core/src/gen7/frame.rs
+          if grep -Fq 'rowlet_a_test_tick();' 3gx/sources/main.c; then
+            echo 'Old V6 hook survived' >&2
+            exit 1
+          fi
+
+      - name: Build PokeReader plugin
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/work" -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v13_2_compile.log
+
+      - name: Upload 3GX
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v13-2-auto-reset-nickname
+          path: out/default.3gx
+          if-no-files-found: error
+
+      - name: Upload compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v13-2-compile-log
+          path: rowlet_v13_2_compile.log
+          if-no-files-found: warn
