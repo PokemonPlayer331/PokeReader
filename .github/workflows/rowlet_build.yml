@@ -1,7 +1,7 @@
+name: Build Rowlet Watch
 
-name: Rowlet V9.0 Debug Build With Visible Errors
-
-on: [push, workflow_dispatch]
+on:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -10,248 +10,74 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out clean PokeReader source
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply proven V5 Rowlet detector
+      - name: Apply Rowlet patch
         run: python3 patch/apply_patch.py .
 
-      - name: Apply V6 virtual A input
-        run: python3 patch/apply_input_test.py .
-
-      - name: Apply V7.1 virtual reset test base
-        run: python3 patch/apply_reset_test.py .
-
-      - name: Apply V8.3 controller base
-        run: python3 patch/apply_v8_3.py .
-
-      - name: Convert to V8.9 SAFE Rehid movement test
-        shell: bash
+      - name: Fix libctru 2.4.1 compatibility
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path('3gx/sources/main.c')
-          s = path.read_text()
+          ld = Path('3gx/3gx.ld')
+          code = ld.read_text()
+          if '__tdata_align' not in code:
+              needle = 'SORT(CONSTRUCTORS)\n\t\t. = ALIGN(4);'
+              assert needle in code, 'Cannot locate rodata section in 3gx/3gx.ld'
+              code = code.replace(
+                  needle,
+                  needle + '\n\t\t__tdata_align = .;\n\t\tLONG (ALIGNOF(.tdata));\n\t\t. = ALIGN(4);',
+                  1,
+              )
+          needle = '\t\t__tls_start = .;\n\t\t. += + SIZEOF(.tdata) + SIZEOF(.tbss);'
+          if needle in code:
+              code = code.replace(
+                  needle,
+                  '\t\t. = 8 + ABSOLUTE(ALIGN(ABSOLUTE(. - 8), MAX(4, ALIGNOF(.tdata))));\n'
+                  '\t\t__tls_start = .;\n'
+                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
+                  1,
+              )
+          ld.write_text(code)
 
-          def replace(old, new):
-              global s
-              count = s.count(old)
-              if count != 1:
-                  raise SystemExit(f'V8.9: expected 1 anchor, got {count}: {old[:85]!r}')
-              s = s.replace(old, new, 1)
-
-          replace('if (v8_frames < 28 && !rowlet_v8_inject(0, true)) {',
-                  'if (v8_frames < 28 && !rowlet_v8_inject(KEY_DUP, false)) {')
-
-          replace('if (v8_state == 6) expected_virtual = KEY_L | KEY_R | KEY_START;',
-                  'if (v8_state == 6) expected_virtual = KEY_L | KEY_R | KEY_START;\n'
-                  '    if (v8_state == 3) expected_virtual = KEY_DUP | KEY_CPAD_UP;')
-
-          replace('const u32 arm = KEY_L | KEY_DUP;',
-                  'const u32 arm = KEY_L | KEY_R | KEY_B;')
-          replace('const u32 stop = KEY_L | KEY_DDOWN;',
-                  'const u32 stop = KEY_L | KEY_R | KEY_Y;')
-
-          def replace_span(begin, finish, new):
-              global s
-              if s.count(begin) != 1 or s.count(finish) != 1:
-                  raise SystemExit('V8.9: expected unique controller block anchors')
-              a = s.index(begin)
-              b = s.index(finish, a) + len(finish)
-              s = s[:a] + new + s[b:]
-
-          replace_span('    if (!v8_initialized) {',
-                       '\n    // Emergency stop',
-                       '    if (!v8_initialized) {\n'
-                       '        v8_initialized = true;\n'
-                       '        v8_fs_ready = false;\n'
-                       '    }\n\n    // Emergency stop')
-
-          replace_span('            if (!v8_write_session(V8_MAX_RESETS)) {',
-                       '            v8_remaining = V8_MAX_RESETS;',
-                       '            v8_remaining = 0;')
-          replace('        if (!v8_write_session(0)) v8_fs_error = 4;\n', '')
-
-          replace_span('    if (v8_state == 6) {',
-                       '\n}\n\nstatic void rowlet_v8_overlay',
-                       '    if (v8_state == 6) { v8_stop(8); return; }'
-                       '\n}\n\nstatic void rowlet_v8_overlay')
-          replace('#define V8_MAX_RESETS 2u', '#define V8_MAX_RESETS 0u')
-
-          replace('const char *status="OFF - L+UP";',
-                  'const char *status="OFF - L+R+B";')
-          replace('case 3: status="WALKING FORWARD";',
-                  'case 3: status="WALK VIA REHID";')
-          replace('"V8.3 %s | R:%lu P:%lu E:%u FS:%u"',
-                  '"V8.9 %s | R:%lu P:%lu E:%u FS:%u"')
-
-          path.write_text(s)
-          print('V8.9 installed: L+R+B start, L+R+Y stop, virtual D-pad movement.')
-          print('V8.9: session auto-resume OFF, ALL automatic soft resets OFF.')
+          src = Path('3gx/sources/main.c')
+          code = src.read_text()
+          if '__system_runflags' not in code or '__apt_appid' not in code:
+              needle = 'u32 __ctru_linear_heap_size = 0;'
+              assert needle in code, 'Cannot locate heap definitions in 3gx/sources/main.c'
+              code = code.replace(
+                  needle,
+                  needle + '\n\n/* libctru symbols expected by its APT support. */\n'
+                  'u32 __system_runflags = 0;\n'
+                  'u32 __apt_appid = 0;',
+                  1,
+              )
+          src.write_text(code)
           PY
 
-      - name: Validate V8.9 version and safety markers
-        run: |
-          grep -Fq 'V8.9 %s' 3gx/sources/main.c
-          grep -Fq 'OFF - L+R+B' 3gx/sources/main.c
-          grep -Fq 'WALK VIA REHID' 3gx/sources/main.c
-          grep -Fq 'rowlet_v8_inject(KEY_DUP, false)' 3gx/sources/main.c
-          grep -Fq '#define V8_MAX_RESETS 0u' 3gx/sources/main.c
-
-      - name: Apply V9.0 high-frequency Circle Pad movement
+      - name: Compile and save log
         shell: bash
         run: |
-          python3 - <<'PYCODE'
-          from pathlib import Path
-
-          hpath = Path('3gx/sources/hid.c')
-          dpath = Path('3gx/includes/hid.h')
-          mpath = Path('3gx/sources/main.c')
-          h, d, m = hpath.read_text(), dpath.read_text(), mpath.read_text()
-
-          def once(s, old, new, label):
-              hits = s.count(old)
-              if hits != 1:
-                  raise SystemExit(f'V9.0: {label}: expected 1 anchor, saw {hits}')
-              return s.replace(old, new, 1)
-
-          h += r'''
-
-          // ROWLET_V90_HIGH_FREQ_CPAD
-          // Experimental helper thread, idle unless movement is armed.
-          static volatile unsigned v90_lease = 0;
-          static bool v90_thread_running = false;
-
-          static void rowlet_v90_worker(void *unused)
-          {
-              (void)unused;
-              while (true) {
-                  if (v90_lease == 0) {
-                      svcSleepThread(12000000LL); // 12 ms idle
-                      continue;
-                  }
-                  --v90_lease;
-                  if (g_key_addr) {
-                      volatile u32 *base = g_key_addr - (0x28 / 4);
-                      u32 i = base[0x10 / 4];
-                      if (i < 8) {
-                          volatile u32 *slot = base + (0x28 / 4) + i * (0x10 / 4);
-                          u32 pa = svcConvertVAToPA((const void *)slot, false);
-                          if (pa) {
-                              volatile u32 *s = (volatile u32 *)(pa | 0x80000000u);
-                              s[3] = (u32)(145u << 16);
-                              s[0] = (s[0] & ~(KEY_CPAD_DOWN | KEY_CPAD_LEFT |
-                                                KEY_CPAD_RIGHT)) | KEY_CPAD_UP;
-                              s[1] |= KEY_CPAD_UP;
-                              s[2] &= ~KEY_CPAD_UP;
-                          }
-                      }
-                  }
-                  svcSleepThread(2000000LL); // 2ms
-              }
-          }
-
-          bool rowlet_v90_walk_keepalive(void)
-          {
-              if (!g_key_addr) return false;
-              if (!v90_thread_running) {
-                  Thread t = threadCreate(rowlet_v90_worker, NULL, 8192,
-                                          0x26, -2, true);
-                  if (!t) return false;
-                  v90_thread_running = true;
-              }
-              v90_lease = 35;
-              return true;
-          }
-
-          void rowlet_v90_walk_off(void)
-          {
-              v90_lease = 0;
-          }
-          '''
-
-          d += '''
-          // ROWLET_V90_HIGH_FREQ_CPAD
-          bool rowlet_v90_walk_keepalive(void);
-          void rowlet_v90_walk_off(void);
-          '''
-
-          m = once(m,
-              'if (v8_frames < 28 && !rowlet_v8_inject(KEY_DUP, false)) {',
-              'if (v8_frames < 55 && !rowlet_v90_walk_keepalive()) {',
-              'replace virtual D-pad with high-frequency Circle Pad')
-          m = once(m,
-              'if (v8_frames >= 28) v8_go(4);',
-              'if (v8_frames >= 55) v8_go(4);',
-              'bound walking phase')
-          m = once(m,
-              'if (v8_state == 3) expected_virtual = KEY_DUP | KEY_CPAD_UP;',
-              'if (v8_state == 3) expected_virtual = KEY_CPAD_UP;',
-              'filter synthetic Circle Pad key')
-          m = once(m,
-              'static void v8_stop(unsigned status)\n{\n',
-              'static void v8_stop(unsigned status)\n{\n    rowlet_v90_walk_off();\n',
-              'stop movement on safety stop')
-          m = once(m,
-              'static void v8_go(unsigned state)\n{\n',
-              'static void v8_go(unsigned state)\n{\n    if (state != 3) rowlet_v90_walk_off();\n',
-              'stop movement on state transition')
-          m = once(m, 'V8.9 %s | R:%lu P:%lu E:%u FS:%u',
-                   'V9.0 %s | R:%lu P:%lu E:%u FS:%u', 'version label')
-          m = once(m, 'case 3: status="WALK VIA REHID";',
-                   'case 3: status="FAST CPAD WALK";', 'walking status')
-
-          hpath.write_text(h)
-          dpath.write_text(d)
-          mpath.write_text(m)
-          print('V9.0 fast circle-pad helper installed; no Rehid remap needed.')
-          print('Automatic resets and auto-resume remain DISABLED.')
-          PYCODE
-
-      - name: Validate V9.0 safe movement patch
-        run: |
-          grep -Fq 'V9.0 %s' 3gx/sources/main.c
-          grep -Fq 'FAST CPAD WALK' 3gx/sources/main.c
-          grep -Fq 'rowlet_v90_walk_keepalive()' 3gx/sources/main.c
-          grep -Fq 'ROWLET_V90_HIGH_FREQ_CPAD' 3gx/sources/hid.c
-          grep -Fq '#define V8_MAX_RESETS 0u' 3gx/sources/main.c
-          ! grep -Fq 'rowlet_v8_inject(KEY_L | KEY_R | KEY_START, false)' 3gx/sources/main.c
-
-      - name: Compile and show error on GitHub summary
-        shell: bash
-        run: |
-          set +e
+          set -o pipefail
           docker run --rm \
             -v "$PWD:/work" \
             -w /work \
-            zaksabeast/devkitarm-rust make > v90_compile.log 2>&1
-          result=$?
-          cat v90_compile.log
-          if [ "$result" -ne 0 ]; then
-            echo '::error title=V9.0 compilation failed::Open the Summary tab to see the compiler output below.'
-            {
-              echo '## V9.0 compilation error (actual output)'
-              echo "Make/Docker exit code: $result"
-              echo ''
-              echo '```text'
-              tail -n 75 v90_compile.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-          exit "$result"
+            zaksabeast/devkitarm-rust make 2>&1 | tee v90_compile.log
 
-      - name: Upload compile log even if failed
-        if: failure()
+      - name: Upload plugin
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v9-0-debug-error-log
-          path: v90_compile.log
-          if-no-files-found: ignore
-
-      - name: Upload V9.0 plugin
-        uses: actions/upload-artifact@v4
-        with:
-          name: rowlet-v9-0-fast-cpad-test
+          name: rowlet-watch-plugin
           path: out/default.3gx
           if-no-files-found: error
+
+      - name: Upload compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-compile-log
+          path: v90_compile.log
+          if-no-files-found: warn
