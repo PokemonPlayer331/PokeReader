@@ -1,5 +1,5 @@
 
-name: Build Rowlet V11.2 Raw Stick XY Diagnostic
+name: Build Rowlet V11.3 Measured Two-Step Dry Run
 
 on:
   workflow_dispatch:
@@ -14,98 +14,98 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply original Rowlet Watch V5
+      - name: Apply Rowlet Watch V5
         run: python3 patch/apply_patch.py .
 
-      - name: Instrument exact stick input values
+      - name: Apply previously working V6 virtual A bridge
+        run: python3 patch/apply_input_test.py .
+
+      - name: V11.3 game-side measured stick experiment
         shell: bash
         run: |
-          cat > /tmp/v112.py <<'PY'
+          cat > /tmp/v113.py <<'PY'
           from pathlib import Path
+
           main = Path('3gx/sources/main.c')
+          hid = Path('3gx/sources/hid.c')
+          h = hid.read_text()
+
+          if '#include "csvc.h"' not in h:
+              needle = '#include "common.h"'
+              if h.count(needle) != 1:
+                  raise RuntimeError('V6 common.h include missing')
+              h = h.replace(
+                  needle,
+                  needle + '\n#include "csvc.h"',
+                  1
+              )
+              hid.write_text(h)
+
           s = main.read_text()
 
           observer = r'''
-          // V11.2 Ultra Sun v1.2 raw stick diagnostic.
-          // No automatic movement, A presses, or resets.
-          #define V112_TITLE 0x00040000001B5000ULL
-          #define V112_TARGET 0x004B6DD8u
-          #define V112_OP0 0xE92D4070u
-          #define V112_OP1 0xE1A04000u
-          #define V112_JUMP 0xE51FF004u
+          // V11.3 Ultra Sun v1.2 measured stick test.
+          // Physical Up reached Y=+104 in V11.2.
+          // DRY RUN: no automatic reset.
 
-          // 0 READY, 1 RELEASE, 2 IDLE,
-          // 3 UP NOW, 4 DONE, 5 STOP.
-          static volatile u32 v112_phase = 0;
-          static u32 v112_hook_status = 0;
-          static u32 v112_frames = 0;
-          static u32 v112_release = 0;
+          #define V113_TITLE 0x00040000001B5000ULL
+          #define V113_TARGET 0x004B6DD8u
+          #define V113_OP0 0xE92D4070u
+          #define V113_OP1 0xE1A04000u
+          #define V113_JUMP 0xE51FF004u
 
-          typedef struct {
-              volatile s32 min_x;
-              volatile s32 max_x;
-              volatile s32 min_y;
-              volatile s32 max_y;
-              volatile u32 samples;
-          } V112Samples;
+          // 0 idle, 1 Up, 2 neutral.
+          static volatile u32 v113_inject_mode = 0;
+          static volatile u32 v113_up_hits = 0;
+          static volatile u32 v113_release_hits = 0;
+          static volatile s32 v113_last_y_before = 0;
+          static volatile s32 v113_last_y_after = 0;
+          static volatile u32 v113_hook_status = 0;
 
-          static V112Samples v112_idle_samples;
-          static V112Samples v112_move_samples;
-
-          static void v112_clear(V112Samples *r)
-          {
-              r->min_x = 32767;
-              r->max_x = -32768;
-              r->min_y = 32767;
-              r->max_y = -32768;
-              r->samples = 0;
-          }
-
-          // The original function reads its source
-          // pointer at [r0+8], then signed values at
-          // source+12 (X) and source+14 (Y).
           __attribute__((used, noinline))
-          static void v112_capture(const void *input)
+          static void v113_modify_stick(void *input)
           {
-              u32 phase = v112_phase;
+              u32 mode = v113_inject_mode;
 
-              if (phase != 2 && phase != 3)
+              if (!input || !mode)
                   return;
 
-              if (!input)
-                  return;
-
-              const volatile s16 *coords =
-                  (const volatile s16 *)(
-                      (const u8 *)input + 12
+              volatile s16 *xy =
+                  (volatile s16 *)(
+                      (u8 *)input + 12
                   );
 
-              s32 x = (s32)coords[0];
-              s32 y = (s32)coords[1];
+              v113_last_y_before = (s32)xy[1];
 
-              V112Samples *r =
-                  phase == 2
-                  ? &v112_idle_samples
-                  : &v112_move_samples;
+              if (mode == 1) {
+                  // Copy the actual measured Up value.
+                  xy[0] = 0;
+                  xy[1] = 104;
 
-              if (x < r->min_x) r->min_x = x;
-              if (x > r->max_x) r->max_x = x;
-              if (y < r->min_y) r->min_y = y;
-              if (y > r->max_y) r->max_y = y;
+                  ++v113_up_hits;
+              }
 
-              r->samples++;
+              else if (mode == 2) {
+                  // Release to neutral.
+                  xy[0] = 0;
+                  xy[1] = 0;
+
+                  ++v113_release_hits;
+              }
+
+              v113_last_y_after = (s32)xy[1];
           }
 
-          // Preserve original registers and replay
-          // the two instructions being replaced.
+          // Preserve registers, replay original instructions,
+          // then return to the original routine.
           __attribute__((naked, used, noinline, aligned(4)))
-          static void v112_trampoline(void)
+          static void v113_trampoline(void)
           {
               __asm__ volatile(
                   ".arm\n"
                   "stmdb sp!, {r0-r3, r12, lr}\n"
-                  "ldr r0, [r0, #8]\n"
-                  "bl v112_capture\n"
+                  "mov r0, r1\n"
+                  "bl v113_modify_stick\n"
                   "ldmia sp!, {r0-r3, r12, lr}\n"
                   "stmdb sp!, {r4, r5, r6, lr}\n"
                   "mov r4, r0\n"
@@ -113,35 +113,37 @@ jobs:
               );
           }
 
-          static void v112_install(void)
+          static void v113_install(void)
           {
-              if (get_title_id() != V112_TITLE)
+              if (get_title_id() != V113_TITLE)
                   return;
 
               volatile u32 *code =
-                  (volatile u32 *)V112_TARGET;
+                  (volatile u32 *)V113_TARGET;
 
-              if (code[0] != V112_OP0 ||
-                  code[1] != V112_OP1) {
-                  v112_hook_status = 2;
+              if (
+                  code[0] != V113_OP0 ||
+                  code[1] != V113_OP1
+              ) {
+                  v113_hook_status = 2;
                   return;
               }
 
               u32 dest =
-                  (u32)(void *)v112_trampoline;
+                  (u32)(void *)v113_trampoline;
 
               if (dest & 3u) {
-                  v112_hook_status = 4;
+                  v113_hook_status = 4;
                   return;
               }
 
               u32 pa = svcConvertVAToPA(
-                  (const void *)V112_TARGET,
+                  (const void *)V113_TARGET,
                   false
               );
 
               if (!pa || (pa & 3u)) {
-                  v112_hook_status = 3;
+                  v113_hook_status = 3;
                   return;
               }
 
@@ -151,187 +153,232 @@ jobs:
                   );
 
               p[1] = dest;
-              p[0] = V112_JUMP;
+              p[0] = V113_JUMP;
 
               svcInvalidateEntireInstructionCache();
 
-              v112_hook_status = 1;
+              v113_hook_status = 1;
           }
 
-          static void v112_tick(void)
+          // 0 READY
+          // 1 RELEASE BUTTONS
+          // 2 UP
+          // 3 NEUTRAL
+          // 4 A PRESS
+          // 5 DONE
+          // 6 STOP/ERROR
+
+          static u32 v113_state = 0;
+          static u32 v113_frames = 0;
+          static u32 v113_idle = 0;
+          static u32 v113_a_calls = 0;
+          static u32 v113_error = 0;
+
+          static void v113_set(u32 new_state)
           {
-              if (get_title_id() != V112_TITLE ||
-                  v112_hook_status != 1)
+              v113_state = new_state;
+              v113_frames = 0;
+          }
+
+          static void v113_abort(u32 reason)
+          {
+              v113_inject_mode = 2;
+              v113_error = reason;
+              v113_set(6);
+          }
+
+          static void v113_tick(void)
+          {
+              if (
+                  get_title_id() != V113_TITLE ||
+                  v113_hook_status != 1
+              )
                   return;
 
               u32 keys = get_current_keys();
 
-              // L + R + Y trigger. No X.
-              const u32 trigger =
+              // No X activation.
+              const u32 chord =
                   KEY_L | KEY_R | KEY_Y;
 
-              if (v112_phase == 0) {
-                  if ((keys & trigger) == trigger &&
-                      !(keys & KEY_X)) {
+              if (v113_state == 0) {
+                  if (
+                      (keys & chord) == chord &&
+                      !(keys & KEY_X)
+                  ) {
+                      v113_a_calls = 0;
+                      v113_up_hits = 0;
+                      v113_release_hits = 0;
+                      v113_error = 0;
+                      v113_inject_mode = 0;
+                      v113_idle = 0;
 
-                      v112_clear(&v112_idle_samples);
-                      v112_clear(&v112_move_samples);
-
-                      v112_frames = 0;
-                      v112_release = 0;
-                      v112_phase = 1;
+                      v113_set(1);
                   }
 
                   return;
               }
 
-              if (keys & KEY_B) {
-                  v112_phase = 5;
+              if (v113_state == 5)
+                  return;
+
+              if (v113_state == 6) {
+                  if (++v113_frames >= 45)
+                      v113_inject_mode = 0;
+
                   return;
               }
 
-              if (v112_phase == 1) {
-                  v112_release =
-                      keys == 0
-                      ? v112_release + 1
+              // Physical B cancels.
+              if (keys & KEY_B) {
+                  v113_abort(1);
+                  return;
+              }
+
+              if (v113_state == 1) {
+                  v113_idle =
+                      (keys == 0)
+                      ? v113_idle + 1
                       : 0;
 
-                  if (++v112_frames >= 600) {
-                      v112_phase = 5;
+                  if (v113_idle >= 15) {
+                      v113_inject_mode = 1;
+                      v113_set(2);
                       return;
                   }
 
-                  if (v112_release >= 15) {
-                      v112_frames = 0;
-                      v112_phase = 2;
+                  if (++v113_frames > 600)
+                      v113_abort(2);
+
+                  return;
+              }
+
+              if (keys & ~(KEY_A | KEY_DUP)) {
+                  v113_abort(3);
+                  return;
+              }
+
+              if (v113_state == 2) {
+                  // Hold game-side Up for 150 frames.
+                  // The save requires two actual steps.
+                  if (++v113_frames >= 150) {
+                      v113_inject_mode = 2;
+                      v113_set(3);
                   }
 
                   return;
               }
 
-              if (v112_phase == 2) {
-                  // Three seconds standing still.
-                  if (++v112_frames >= 180) {
-                      v112_frames = 0;
-                      v112_phase = 3;
+              if (v113_state == 3) {
+                  // Release Up before A presses.
+                  if (++v113_frames >= 35) {
+                      v113_inject_mode = 0;
+                      v113_set(4);
                   }
+
+                  return;
               }
 
-              else if (v112_phase == 3) {
-                  // Three seconds moving physically.
-                  if (++v112_frames >= 180)
-                      v112_phase = 4;
+              if (v113_state == 4) {
+                  // Use the proven V6 virtual A function.
+                  // Ten short pulses, no reset.
+                  if (v113_frames < 350) {
+                      if ((v113_frames % 35) < 6) {
+                          if (!rowlet_try_inject_a_frame()) {
+                              v113_abort(4);
+                              return;
+                          }
+
+                          ++v113_a_calls;
+                      }
+                  } else {
+                      v113_inject_mode = 0;
+                      v113_set(5);
+                      return;
+                  }
+
+                  ++v113_frames;
               }
           }
 
-          static void v112_overlay(void)
+          static void v113_overlay(void)
           {
-              if (get_title_id() != V112_TITLE)
+              if (get_title_id() != V113_TITLE)
                   return;
 
-              const char *state = "READY";
+              const char *label = "READY";
 
-              if (v112_hook_status == 0)
-                  state = "NOT READY";
+              if (v113_hook_status != 1) {
+                  label = "HOOK ERR";
+              } else {
+                  if (v113_state == 1)
+                      label = "RELEASE";
 
-              if (v112_hook_status == 2)
-                  state = "ERR OPCODE";
+                  if (v113_state == 2)
+                      label = "UP";
 
-              if (v112_hook_status == 3)
-                  state = "ERR ADDRESS";
+                  if (v113_state == 3)
+                      label = "NEUTRAL";
 
-              if (v112_hook_status == 4)
-                  state = "ERR ALIGN";
+                  if (v113_state == 4)
+                      label = "A PRESS";
 
-              if (v112_hook_status == 1) {
-                  if (v112_phase == 1)
-                      state = "RELEASE";
+                  if (v113_state == 5)
+                      label = "DONE";
 
-                  if (v112_phase == 2)
-                      state = "IDLE";
-
-                  if (v112_phase == 3)
-                      state = "UP NOW";
-
-                  if (v112_phase == 4)
-                      state = "DONE";
-
-                  if (v112_phase == 5)
-                      state = "STOP";
+                  if (v113_state == 6)
+                      label = "STOP";
               }
 
-              char buf[80];
-
-              snprintf(
-                  buf,
-                  sizeof(buf),
-                  "V11.2 %s",
-                  state
-              );
+              char buf[64];
 
               host_print(
-                  (u32)buf,
-                  strlen(buf),
+                  (u32)"V11.3 DRY / 2 STEPS",
+                  19,
                   0x00ffff
               );
 
-              if (v112_idle_samples.samples) {
-                  snprintf(
-                      buf,
-                      sizeof(buf),
-                      "I X:%ld/%ld Y:%ld/%ld",
-                      (long)v112_idle_samples.min_x,
-                      (long)v112_idle_samples.max_x,
-                      (long)v112_idle_samples.min_y,
-                      (long)v112_idle_samples.max_y
-                  );
-              } else {
-                  snprintf(
-                      buf,
-                      sizeof(buf),
-                      "I X:-- Y:--"
-                  );
-              }
-
               host_print(
-                  (u32)buf,
-                  strlen(buf),
-                  0x00ffff
-              );
-
-              if (v112_move_samples.samples) {
-                  snprintf(
-                      buf,
-                      sizeof(buf),
-                      "M X:%ld/%ld Y:%ld/%ld",
-                      (long)v112_move_samples.min_x,
-                      (long)v112_move_samples.max_x,
-                      (long)v112_move_samples.min_y,
-                      (long)v112_move_samples.max_y
-                  );
-              } else {
-                  snprintf(
-                      buf,
-                      sizeof(buf),
-                      "M X:-- Y:--"
-                  );
-              }
-
-              host_print(
-                  (u32)buf,
-                  strlen(buf),
+                  (u32)"L+R+Y START  B:STOP",
+                  19,
                   0x00ffff
               );
 
               snprintf(
                   buf,
                   sizeof(buf),
-                  "N:%lu/%lu LRY START",
-                  (unsigned long)
-                      v112_idle_samples.samples,
-                  (unsigned long)
-                      v112_move_samples.samples
+                  "S:%s Y:%ld/%ld",
+                  label,
+                  (long)v113_last_y_before,
+                  (long)v113_last_y_after
               );
+
+              host_print(
+                  (u32)buf,
+                  strlen(buf),
+                  0x00ffff
+              );
+
+              if (
+                  v113_hook_status == 1 &&
+                  v113_state != 6
+              ) {
+                  snprintf(
+                      buf,
+                      sizeof(buf),
+                      "UP:%lu A:%lu",
+                      (unsigned long)v113_up_hits,
+                      (unsigned long)v113_a_calls
+                  );
+              } else {
+                  snprintf(
+                      buf,
+                      sizeof(buf),
+                      "ERR:%lu/%lu",
+                      (unsigned long)v113_hook_status,
+                      (unsigned long)v113_error
+                  );
+              }
 
               host_print(
                   (u32)buf,
@@ -345,7 +392,7 @@ jobs:
 
           if s.count(needle) != 1:
               raise RuntimeError(
-                  'V11.2 run_hook insertion missing'
+                  'V11.3 run_hook insertion point missing'
               )
 
           s = s.replace(
@@ -354,26 +401,40 @@ jobs:
               1
           )
 
-          old = (
+          hook_start = (
               '        scan_input();\n'
-              '        run_frame();\n'
-              '        draw_to_screen(screenId, fb_a, stride, format);'
+              '        rowlet_a_test_tick();\n'
+              '        run_frame();'
           )
 
-          new = (
-              '        scan_input();\n'
-              '        v112_tick();\n'
-              '        run_frame();\n'
-              '        v112_overlay();\n'
-              '        draw_to_screen(screenId, fb_a, stride, format);'
+          hook_end = (
+              '        draw_to_screen('
+              'screenId, fb_a, stride, format);'
           )
 
-          if s.count(old) != 1:
+          if (
+              s.count(hook_start) != 1 or
+              s.count(hook_end) != 1
+          ):
               raise RuntimeError(
-                  'V11.2 framebuffer hook missing'
+                  'V11.3 V6 framebuffer hook missing'
               )
 
-          s = s.replace(old, new, 1)
+          a = s.index(hook_start)
+          b = (
+              s.index(hook_end, a)
+              + len(hook_end)
+          )
+
+          s = (
+              s[:a]
+              + '        scan_input();\n'
+              + '        v113_tick();\n'
+              + '        run_frame();\n'
+              + '        v113_overlay();\n'
+              + hook_end
+              + s[b:]
+          )
 
           old = (
               '    initialize();\n'
@@ -382,26 +443,28 @@ jobs:
 
           new = (
               '    initialize();\n'
-              '    v112_install();\n'
+              '    v113_install();\n'
               '    svcInvalidateEntireInstructionCache();'
           )
 
           if s.count(old) != 1:
               raise RuntimeError(
-                  'V11.2 startup hook missing'
+                  'V11.3 startup hook missing'
               )
 
           s = s.replace(old, new, 1)
 
           main.write_text(s)
 
-          print("V11.2 diagnostic installed")
-          print("Input: Physical D-pad + rehid")
-          print("Automatic input: DISABLED")
+          print("V11.3 patch applied")
+          print("Trigger: L + R + Y")
+          print("Movement value: Y = +104")
+          print("Movement duration: 150 frames")
+          print("Virtual A: V6 bridge")
           print("Automatic reset: DISABLED")
           PY
 
-          python3 /tmp/v112.py
+          python3 /tmp/v113.py
 
       - name: Fix libctru compatibility
         shell: bash
@@ -437,8 +500,7 @@ jobs:
                   'ABSOLUTE(. - 8), '
                   'MAX(4, ALIGNOF(.tdata))));\n'
                   '\t\t__tls_start = .;\n'
-                  '\t\t. += SIZEOF(.tdata) + '
-                  'SIZEOF(.tbss);',
+                  '\t\t. += SIZEOF(.tdata) + SIZEOF(.tbss);',
                   1
               )
 
@@ -473,13 +535,13 @@ jobs:
             -v "$PWD:/work" \
             -w /work \
             zaksabeast/devkitarm-rust make \
-            2>&1 | tee v112_compile.log
+            2>&1 | tee v113_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v11-2-xy-diagnostic
+          name: rowlet-v11-3-two-step-dry-run
           path: out/default.3gx
           if-no-files-found: error
 
@@ -487,6 +549,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v11-2-compile-log
-          path: v112_compile.log
+          name: rowlet-v11-3-compile-log
+          path: v113_compile.log
           if-no-files-found: warn
