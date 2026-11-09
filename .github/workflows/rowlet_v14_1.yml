@@ -1,5 +1,5 @@
 
-name: Build Rowlet V13.3 Persistent Reset Counter
+name: Build Rowlet V13.4 Persistent SD Counter
 
 'on':
   workflow_dispatch:
@@ -15,18 +15,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Restore original V13.2
+      - name: Restore original working V13.2
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          from pathlib import Path
           import subprocess
           import yaml
-          from pathlib import Path
 
           path = Path(".github/workflows/rowlet_build.yml")
-          doc = yaml.safe_load(path.read_text())
-          steps = doc["jobs"]["build"]["steps"]
+          if not path.exists():
+              raise SystemExit("Original V13.2 workflow missing")
+
+          workflow = yaml.safe_load(path.read_text())
+          steps = workflow["jobs"]["build"]["steps"]
 
           names = [
               "Apply V5 decoded Rowlet watcher",
@@ -39,29 +42,32 @@ jobs:
 
           for name in names:
               matches = [
-                  s for s in steps
-                  if s.get("name") == name
+                  step for step in steps
+                  if step.get("name") == name
               ]
               if len(matches) != 1:
                   raise SystemExit("Missing V13.2 step: " + name)
 
               print("Applying:", name, flush=True)
               subprocess.run(
-                  ["bash", "-e", "-o", "pipefail",
-                   "-c", matches[0]["run"]],
+                  [
+                      "bash", "-e", "-o", "pipefail",
+                      "-c", matches[0]["run"]
+                  ],
                   check=True
               )
 
           print("Original V13.2 restored")
           PY
 
-      - name: Add SD card counter
+      - name: Install SD counter with verified reset hook
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/rowlet_v133.py <<'PY'
+          cat > /tmp/rowlet_v134.py <<'PY'
           from pathlib import Path
+          import re
 
           main = Path("3gx/sources/main.c")
           frame = Path("reader_core/src/gen7/frame.rs")
@@ -69,102 +75,112 @@ jobs:
           m = main.read_text()
           f = frame.read_text()
 
-          def replace_once(text, old, new, description):
-              count = text.count(old)
+          def once(s, old, new, label):
+              count = s.count(old)
               if count != 1:
                   raise SystemExit(
-                      description + ": expected one match, found " +
-                      str(count)
+                      "%s: expected 1 match, found %d"
+                      % (label, count)
                   )
-              return text.replace(old, new, 1)
+              return s.replace(old, new, 1)
 
-          sd_code = r'''
-          // V13.3 persistent reset counter.
-          // Two alternating records in SD root.
+          # V13.2 has one original increment.
+          # Remove it BEFORE inserting the new one.
+          m = once(
+              m,
+              "v13_resets++;",
+              "/* counted before reset sequence */",
+              "Original reset increment"
+          )
 
-          #define ROWLET_SD_MAGIC 0x524C5433u
-          #define ROWLET_SD_CHECK 0xAC57F00Du
+          sd_helpers = r'''
+          // Rowlet V13.4 persistent counter.
+          // File: SD root /rowlet_resets.dat
 
-          static const char rowlet_sd_path[] =
+          #define ROWLET_SD_MAGIC 0x524C5434u
+          #define ROWLET_SD_SALT  0xCA57F00Du
+
+          static const char rowlet_sd_filename[] =
               "/rowlet_resets.dat";
 
-          static bool rowlet_sd_initialized = false;
-          static bool rowlet_sd_available = false;
+          static bool rowlet_sd_loaded = false;
+          static bool rowlet_sd_ready = false;
 
-          // 0 starting, 1 ready, 2 saved, 3 error
-          static volatile u32 rowlet_sd_state = 0;
+          static volatile u32 rowlet_sd_status = 0;
 
           typedef struct {
               u32 magic;
               u32 count;
               u32 checksum;
-          } RowletSDRecord;
+          } RowletSave;
 
           u32 rowlet_get_reset_count(void)
           {
               return v13_resets;
           }
 
-          u32 rowlet_get_sd_state(void)
+          u32 rowlet_get_sd_status(void)
           {
-              return rowlet_sd_state;
-          }
-
-          static FS_Path rowlet_sd_archive_path(void)
-          {
-              return fsMakePath(PATH_EMPTY, "");
-          }
-
-          static FS_Path rowlet_sd_file_path(void)
-          {
-              return fsMakePath(PATH_ASCII, rowlet_sd_path);
+              return rowlet_sd_status;
           }
 
           static bool rowlet_sd_valid(
-              const RowletSDRecord *r
+              const RowletSave *r
           )
           {
               return
                   r->magic == ROWLET_SD_MAGIC &&
                   r->checksum ==
-                  (r->count ^ ROWLET_SD_MAGIC ^
-                   ROWLET_SD_CHECK);
+                  (
+                      r->count ^
+                      ROWLET_SD_MAGIC ^
+                      ROWLET_SD_SALT
+                  );
           }
 
           static void rowlet_sd_load(void)
           {
-              if (rowlet_sd_initialized)
+              if (rowlet_sd_loaded)
                   return;
 
-              rowlet_sd_initialized = true;
+              rowlet_sd_loaded = true;
 
               Result rc = fsInit();
 
               if (R_FAILED(rc)) {
-                  rowlet_sd_state = 3;
+                  rowlet_sd_status = 3;
                   return;
               }
 
-              rowlet_sd_available = true;
-              rowlet_sd_state = 1;
+              rowlet_sd_ready = true;
+              rowlet_sd_status = 1;
+
+              FS_Path archive =
+                  fsMakePath(PATH_EMPTY, "");
+
+              FS_Path file_path =
+                  fsMakePath(
+                      PATH_ASCII,
+                      rowlet_sd_filename
+                  );
 
               Handle file = 0;
 
               rc = FSUSER_OpenFileDirectly(
                   &file,
                   ARCHIVE_SDMC,
-                  rowlet_sd_archive_path(),
-                  rowlet_sd_file_path(),
+                  archive,
+                  file_path,
                   FS_OPEN_READ,
                   0
               );
 
-              // Missing file is normal the first time.
+              // First launch: no file yet.
               if (R_FAILED(rc))
                   return;
 
-              RowletSDRecord record;
-              u32 best = 0;
+              RowletSave record;
+              u32 highest = 0;
 
               for (u32 slot = 0; slot < 2; slot++) {
                   u32 bytes = 0;
@@ -181,53 +197,59 @@ jobs:
                       R_SUCCEEDED(rc) &&
                       bytes == sizeof(record) &&
                       rowlet_sd_valid(&record) &&
-                      record.count > best
+                      record.count > highest
                   ) {
-                      best = record.count;
+                      highest = record.count;
                   }
               }
 
               FSFILE_Close(file);
 
-              v13_resets = best;
+              v13_resets = highest;
           }
 
           static void rowlet_sd_save(void)
           {
-              if (!rowlet_sd_available) {
-                  rowlet_sd_state = 3;
+              if (!rowlet_sd_ready) {
+                  rowlet_sd_status = 3;
                   return;
               }
+
+              FS_Path archive =
+                  fsMakePath(PATH_EMPTY, "");
+
+              FS_Path file_path =
+                  fsMakePath(
+                      PATH_ASCII,
+                      rowlet_sd_filename
+                  );
 
               Handle file = 0;
 
               Result rc = FSUSER_OpenFileDirectly(
                   &file,
                   ARCHIVE_SDMC,
-                  rowlet_sd_archive_path(),
-                  rowlet_sd_file_path(),
-                  FS_OPEN_READ |
-                  FS_OPEN_WRITE |
-                  FS_OPEN_CREATE,
+                  archive,
+                  file_path,
+                  FS_OPEN_WRITE | FS_OPEN_CREATE,
                   0
               );
 
               if (R_FAILED(rc)) {
-                  rowlet_sd_state = 3;
+                  rowlet_sd_status = 3;
                   return;
               }
 
-              RowletSDRecord record;
+              RowletSave record;
 
               record.magic = ROWLET_SD_MAGIC;
               record.count = v13_resets;
+
               record.checksum =
                   record.count ^
                   ROWLET_SD_MAGIC ^
-                  ROWLET_SD_CHECK;
+                  ROWLET_SD_SALT;
 
-              // Alternate slots, retaining the last
-              // valid record if a write is interrupted.
               u32 slot = record.count & 1u;
               u32 bytes = 0;
 
@@ -246,134 +268,143 @@ jobs:
                   R_SUCCEEDED(rc) &&
                   bytes == sizeof(record)
               ) {
-                  rowlet_sd_state = 2;
+                  rowlet_sd_status = 2;
               } else {
-                  rowlet_sd_state = 3;
+                  rowlet_sd_status = 3;
               }
           }
-
           '''
 
-          # Verified V13.2 source anchors.
-          m = replace_once(
+          m = once(
               m,
               "static void rowlet_v13_tick(void)",
-              sd_code +
+              sd_helpers +
               "\nstatic void rowlet_v13_tick(void)",
-              "SD helpers"
+              "SD helper insertion"
           )
 
-          m = replace_once(
+          # Load once when running Ultra Sun.
+          m = once(
               m,
               "if (get_title_id() != ROWLET_V13_TITLE) return;",
-              """if (get_title_id() != ROWLET_V13_TITLE) return;
-              rowlet_sd_load();""",
-              "SD initialization"
+              (
+                  "if (get_title_id() != ROWLET_V13_TITLE) return;\n"
+                  "              rowlet_sd_load();"
+              ),
+              "SD loading"
           )
 
-          # Save ONCE when the verified non-shiny
-          # phase authorizes the soft reset.
-          # The original V13.2 phase and injection
-          # logic remain otherwise unchanged.
-          m = replace_once(
-              m,
-              "if (v13_phase == 4) {\n"
-              "                rowlet_try_release_a_frame();",
-              "if (v13_phase == 4) {\n"
-              "                v13_resets++;\n"
-              "                rowlet_sd_save();\n"
-              "                rowlet_try_release_a_frame();",
-              "Pre-reset save"
+          # Attach to the verified non-shiny branch.
+          # Match only the branch inside the hunter.
+          pattern = (
+              r"if\s*\(\s*v13_phase\s*==\s*4\s*\)"
+              r"\s*\{\s*"
+              r"rowlet_try_release_a_frame\s*\(\s*\)\s*;"
           )
 
-          # Remove ONLY the old increment that
-          # occurs after the reset chord.
-          m = replace_once(
-              m,
-              "v13_resets++;",
-              "/* old counter increment relocated */",
-              "Original increment"
-          ) if False else m
+          def install_save(match):
+              original = match.group(0)
+              return re.sub(
+                  r"rowlet_try_release_a_frame\s*\(\s*\)\s*;",
+                  (
+                      "v13_resets++;\n"
+                      "                      rowlet_sd_save();\n"
+                      "                      rowlet_try_release_a_frame();"
+                  ),
+                  original,
+                  count=1
+              )
 
-          # There are now two increments: the inserted
-          # increment and V13.2's original increment.
-          # Remove the ORIGINAL by matching its
-          # surrounding mode transition.
-          m = replace_once(
+          m, count = re.subn(
+              pattern,
+              install_save,
               m,
-              "v13_mode = 4; v13_frame = 0; "
-              "v13_missing_hid = 0;\n"
-              "                v13_resets++;",
-              "v13_mode = 4; v13_frame = 0; "
-              "v13_missing_hid = 0;\n"
-              "                /* saved before reset */",
-              "Old post-reset increment"
+              count=1
           )
 
-          # Add counter to V13.2's existing overlay.
+          if count != 1:
+              raise SystemExit(
+                  "Verified non-shiny reset branch not found"
+              )
+
+          # Add two display lines without changing
+          # the existing shiny detection or reset guard.
           display = '''pnp::println!("{}", label);
 
                   extern "C" {
                       fn rowlet_get_reset_count() -> u32;
-                      fn rowlet_get_sd_state() -> u32;
+                      fn rowlet_get_sd_status() -> u32;
                   }
 
-                  let count = unsafe {
+                  let resets = unsafe {
                       rowlet_get_reset_count()
                   };
 
                   let sd = unsafe {
-                      rowlet_get_sd_state()
+                      rowlet_get_sd_status()
                   };
 
-                  pnp::println!("RESETS: {}", count);
+                  pnp::println!("RESETS: {}", resets);
 
-                  let status = match sd {
+                  let sd_message = match sd {
                       0 => "SD: STARTING",
                       1 => "SD: READY",
                       2 => "SD: SAVED",
                       _ => "SD: ERROR",
                   };
 
-                  pnp::println!("{}", status);'''
+                  pnp::println!("{}", sd_message);'''
 
-          f = replace_once(
+          f = once(
               f,
               'pnp::println!("{}", label);',
               display,
               "Counter display"
           )
 
-          for required in (
+          # Safety checks.
+          required_main = [
               "rowlet_v13_tick",
+              "rowlet_sd_load();",
+              "rowlet_sd_save();",
               "rowlet_try_nickname_start_frame",
               "rowlet_v13_halt();",
-              "if (v13_phase == 4)",
               "if (v13_phase == 5 || v13_phase == 6)",
-              "rowlet_sd_save();",
-              "rowlet_sd_load();",
-          ):
-              if required not in m:
+              "rowlet_try_soft_reset_frame(true)",
+          ]
+
+          for marker in required_main:
+              if marker not in m:
                   raise SystemExit(
-                      "Original hunting feature missing: " +
-                      required
+                      "Missing original hunter code: " +
+                      marker
                   )
 
-          if "rowlet_v13_reset_sent" not in f:
-              raise SystemExit("Reset guard missing")
+          if m.count("v13_resets++;") != 1:
+              raise SystemExit(
+                  "Expected exactly one counter increment"
+              )
 
-          if "ROWLET: SHINY!" not in f:
-              raise SystemExit("Shiny status missing")
+          for marker in (
+              "rowlet_v13_reset_sent",
+              "ROWLET: SHINY!",
+              "RESETS: {}",
+              "SD: SAVED"
+          ):
+              if marker not in f:
+                  raise SystemExit(
+                      "Missing overlay/guard: " + marker
+                  )
 
           main.write_text(m)
           frame.write_text(f)
 
-          print("V13.3 persistent counter installed")
+          print("V13.4 SD counter patch installed")
           PY
 
-          python3 /tmp/rowlet_v133.py
+          python3 /tmp/rowlet_v134.py
 
-      - name: Verify source
+      - name: Verify counter and shiny safety
         shell: bash
         run: |
           set -euo pipefail
@@ -405,7 +436,7 @@ jobs:
           grep -Fq 'SD: SAVED' \
             reader_core/src/gen7/frame.rs
 
-          echo "V13.3 verification passed"
+          echo "V13.4 source checks passed"
 
       - name: Build PokeReader plugin
         shell: bash
@@ -416,13 +447,13 @@ jobs:
             -v "$PWD:/work" \
             -w /work \
             zaksabeast/devkitarm-rust make \
-            2>&1 | tee rowlet_v133_compile.log
+            2>&1 | tee rowlet_v134_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v13-3-sd-counter
+          name: rowlet-v13-4-sd-counter
           path: out/default.3gx
           if-no-files-found: error
 
@@ -430,6 +461,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v13-3-compile-log
-          path: rowlet_v133_compile.log
+          name: rowlet-v13-4-compile-log
+          path: rowlet_v134_compile.log
           if-no-files-found: warn
