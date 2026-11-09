@@ -1,4 +1,5 @@
-name: Build Rowlet V14.1 WiFi Retry Fix
+
+name: Build Rowlet V14.2 Offline Gmail Fix
 
 'on':
   workflow_dispatch:
@@ -11,12 +12,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository history
+      - name: Checkout repository and history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Restore V14 hunter and notification code
+      - name: Restore V14 source from Git history
         shell: bash
         env:
           ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
@@ -62,18 +63,19 @@ jobs:
               except yaml.YAMLError:
                   continue
 
-              if (
-                  isinstance(candidate, dict)
-                  and candidate.get("name") ==
+              if not isinstance(candidate, dict):
+                  continue
+
+              if candidate.get("name") == (
                   "Build Rowlet V14 Offline Gmail and Network Test"
               ):
                   previous = candidate
-                  print("Found V14 commit:", commit[:12])
+                  print("Found V14:", commit[:12])
                   break
 
           if previous is None:
               raise SystemExit(
-                  "Cannot find V14 workflow in Git history"
+                  "Original V14 workflow not found in Git history"
               )
 
           steps = previous["jobs"]["build"]["steps"]
@@ -91,28 +93,25 @@ jobs:
 
               if len(matches) != 1:
                   raise SystemExit(
-                      "Missing V14 step: " + name
+                      "Missing original V14 build step: " + name
                   )
 
               print("Applying:", name, flush=True)
 
               subprocess.run(
                   [
-                      "bash",
-                      "-e",
-                      "-o",
-                      "pipefail",
-                      "-c",
-                      matches[0]["run"]
+                      "bash", "-e",
+                      "-o", "pipefail",
+                      "-c", matches[0]["run"]
                   ],
                   env=os.environ.copy(),
                   check=True
               )
 
-          print("V14 source successfully restored")
+          print("Original V14 hunting source restored")
           PY
 
-      - name: Fix offline Gmail retries
+      - name: Remove faulty WiFi detection
         shell: bash
         run: |
           set -euo pipefail
@@ -123,70 +122,54 @@ jobs:
           path = Path("3gx/sources/main.c")
           source = path.read_text()
 
-          # V14 incorrectly assumed that a zero WiFi
-          # strength reading meant no internet was
-          # available. This prevented all HTTP attempts.
+          # Locate the exact networking gate added in V14.
+          beginning = "              // No Wi-Fi signal? Keep the mail pending."
+          ending = "              v137_mail = 2u;"
 
-          old = '''              // No Wi-Fi signal? Keep the mail pending.
-              // Do not attempt HTTP while disconnected.
-              if (osGetWifiStrength() == 0) {
-                  v137_mail = 4u;
-                  v137_net_stage = 8u;
-                  v137_net_error = 0u;
-                  v137_http_status = 0u;
-                  return;
-              }
-
-              // The first connected test checks whether
-              // a normal HTTP website is reachable.
-              // This does not change shiny detection.
-              rowlet_v14_probe();
-
-'''
-
-          new = '''              // V14.1:
-              // Always attempt delivery when due.
-              // Failed requests remain pending.
-              // Never require WiFi for shiny hunting.
-
-'''
-
-          if source.count(old) != 1:
+          if source.count(beginning) != 1:
               raise SystemExit(
-                  "V14 WiFi gate not found. "
-                  "No source changes written."
+                  "V14 WiFi gate not found exactly once"
               )
 
-          source = source.replace(old, new, 1)
+          start = source.index(beginning)
+          end = source.index(ending, start)
 
-          # The V13.7 HTTP error diagnostics remain
-          # in place so we can identify failures.
+          # Keep normal retry timing, but never use
+          # signal strength to cancel an HTTP attempt.
+          replacement = (
+              "              // V14.2: attempt delivery when due.\n"
+              "              // No WiFi gate: failure is handled below.\n"
+              "              // Hunting never depends on networking.\n\n"
+          )
+
+          source = source[:start] + replacement + source[end:]
+
+          if "if (osGetWifiStrength() == 0)" in source:
+              raise SystemExit(
+                  "Faulty WiFi detection was not removed"
+              )
 
           required = [
-              "rowlet_v137_send_mail",
               "rowlet_v137_notify_tick",
+              "rowlet_v137_send_mail",
+              "v137_mail = ok ? 3u : 4u;",
+              "httpcInit(0x1000)",
               "if (v13_phase == 4)",
               "rowlet_v13_halt();",
-              "httpcInit(0x1000)",
           ]
 
           for item in required:
               if item not in source:
                   raise SystemExit(
-                      "Required source missing: " + item
+                      "Required code missing: " + item
                   )
-
-          if "if (osGetWifiStrength() == 0)" in source:
-              raise SystemExit(
-                  "Old WiFi gate is still present"
-              )
 
           path.write_text(source)
 
-          print("V14.1 offline retry fix installed")
+          print("V14.2 WiFi retry fix installed")
           PY
 
-      - name: Verify Rowlet V14.1
+      - name: Verify V14.2 safety and Gmail code
         shell: bash
         run: |
           set -euo pipefail
@@ -218,14 +201,13 @@ jobs:
           grep -Fq 'HTTP:{} TRY:{}' \
             reader_core/src/gen7/frame.rs
 
-          if grep -Fq \
-            'if (osGetWifiStrength() == 0)' \
+          if grep -Fq 'if (osGetWifiStrength() == 0)' \
             3gx/sources/main.c; then
-            echo "Old WiFi gate still present"
+            echo "Faulty WiFi gate still exists"
             exit 1
           fi
 
-          echo "V14.1 source checks passed"
+          echo "V14.2 source checks passed"
 
       - name: Build PokeReader plugin
         shell: bash
@@ -236,13 +218,13 @@ jobs:
             -v "$PWD:/work" \
             -w /work \
             zaksabeast/devkitarm-rust make \
-            2>&1 | tee rowlet_v14_1_compile.log
+            2>&1 | tee rowlet_v14_2_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v14-1-wifi-retry-fix
+          name: rowlet-v14-2-offline-gmail-fix
           path: out/default.3gx
           if-no-files-found: error
 
@@ -250,6 +232,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v14-1-compile-log
-          path: rowlet_v14_1_compile.log
+          name: rowlet-v14-2-compile-log
+          path: rowlet_v14_2_compile.log
           if-no-files-found: warn
