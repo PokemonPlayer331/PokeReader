@@ -1,5 +1,5 @@
 
-name: Build Rowlet V13.8.1 Gmail POST Fix
+name: Build Rowlet V13.9 Private Memory Gmail Fix
 
 'on':
   workflow_dispatch:
@@ -10,210 +10,115 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository with history
+      - name: Checkout repository and workflow history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Recover V13.7 from Git history
+      - name: Rebuild V13.8.1 hunting and Gmail source
         shell: bash
         env:
           ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
           ROWLET_NOTIFY_TOKEN: ${{ secrets.ROWLET_NOTIFY_TOKEN }}
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           import os
           import subprocess
           import yaml
 
-          path = ".github/workflows/rowlet_v13_5_gmail_counter.yml"
+          if not os.environ.get('ROWLET_NOTIFY_URL') or not os.environ.get('ROWLET_NOTIFY_TOKEN'):
+              raise SystemExit('Missing notification GitHub secrets')
 
-          if not os.environ.get("ROWLET_NOTIFY_URL"):
-              raise SystemExit("Missing ROWLET_NOTIFY_URL secret")
-
-          if not os.environ.get("ROWLET_NOTIFY_TOKEN"):
-              raise SystemExit("Missing ROWLET_NOTIFY_TOKEN secret")
-
-          history = subprocess.check_output(
-              ["git", "log", "--all", "--format=%H", "--", path],
-              text=True
+          filename = '.github/workflows/rowlet_v13_5_gmail_counter.yml'
+          commits = subprocess.check_output(
+              ['git', 'log', '--all', '--format=%H', '--', filename], text=True
           ).splitlines()
 
-          old_workflow = None
-
-          for commit in history:
+          previous = None
+          for commit in commits:
               result = subprocess.run(
-                  ["git", "show", f"{commit}:{path}"],
-                  capture_output=True,
-                  text=True
+                  ['git', 'show', f'{commit}:{filename}'],
+                  capture_output=True, text=True
               )
-
-              if result.returncode != 0:
+              if result.returncode:
                   continue
-
               try:
                   candidate = yaml.safe_load(result.stdout)
-              except Exception:
+              except yaml.YAMLError:
                   continue
+              if isinstance(candidate, dict) and candidate.get('name') == 'Build Rowlet V13.8.1 Gmail POST Fix':
+                  previous = candidate
+                  print('Restoring V13.8.1 from commit:', commit[:12])
+                  break
 
-              if not isinstance(candidate, dict):
-                  continue
+          if previous is None:
+              raise SystemExit('V13.8.1 workflow not found in Git history; nothing was changed')
 
-              if candidate.get("name") != (
-                  "Build Rowlet V13.7 Gmail Network Diagnostics"
-              ):
-                  continue
-
-              old_workflow = candidate
-              print("Found original V13.7 commit:", commit[:12])
-              break
-
-          if old_workflow is None:
-              raise SystemExit(
-                  "Cannot find the V13.7 workflow in Git history. "
-                  "No source changes were made."
-              )
-
-          steps = old_workflow["jobs"]["build"]["steps"]
-
-          required = [
-              "Restore working V13.2 hunting code",
-              "Install V13.7 counter and Gmail diagnostics",
-          ]
-
-          for name in required:
-              matches = [
-                  step for step in steps
-                  if step.get("name") == name
-              ]
-
+          steps = previous['jobs']['build']['steps']
+          for name in ('Recover V13.7 from Git history', 'Fix Gmail HTTP buffer and form data'):
+              matches = [step for step in steps if step.get('name') == name]
               if len(matches) != 1:
-                  raise SystemExit(
-                      "Missing original V13.7 step: " + name
-                  )
-
-              print("Applying:", name, flush=True)
-
+                  raise SystemExit('Required V13.8.1 build step missing: ' + name)
+              print('Applying:', name, flush=True)
               subprocess.run(
-                  [
-                      "bash",
-                      "-e",
-                      "-o",
-                      "pipefail",
-                      "-c",
-                      matches[0]["run"]
-                  ],
-                  env=os.environ.copy(),
-                  check=True
+                  ['bash', '-e', '-o', 'pipefail', '-c', matches[0]['run']],
+                  env=os.environ.copy(), check=True
               )
-
-          print("V13.7 source restored successfully")
+          print('V13.8.1 hunting, counter, and Gmail diagnostics restored')
           PY
 
-      - name: Fix Gmail HTTP buffer and form data
+      - name: Enable private memory in plugin header
         shell: bash
         run: |
           set -euo pipefail
-
-          cat > /tmp/v1381_fix.py <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("3gx/sources/main.c")
-          source = path.read_text()
-
-          def replace_once(text, old, new, label):
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(
-                      f"{label}: expected 1 match, found {count}"
-                  )
-              return text.replace(old, new, 1)
-
-          # Allocate a real HTTP shared-memory buffer.
-          source = replace_once(
-              source,
-              "Result rc = httpcInit(0);",
-              "Result rc = httpcInit(0x1000);",
-              "HTTP buffer"
-          )
-
-          # Specify URL-encoded form data before posting.
-          old = '''v137_net_stage = 3u;
-
-              rc = httpcAddPostDataAscii(
-                  &ctx,
-                  "token",
-                  ROWLET_GMAIL_TOKEN
-              );'''
-
-          new = '''v137_net_stage = 3u;
-
-              rc = httpcAddRequestHeaderField(
-                  &ctx,
-                  "Content-Type",
-                  "application/x-www-form-urlencoded"
-              );
-
-              if (R_SUCCEEDED(rc)) {
-                  rc = httpcAddPostDataAscii(
-                      &ctx,
-                      "token",
-                      ROWLET_GMAIL_TOKEN
-                  );
-              }'''
-
-          source = replace_once(
-              source, old, new, "POST form setup"
-          )
-
-          if "if (v13_phase == 4)" not in source:
-              raise SystemExit("Non-shiny reset gate missing")
-
-          if "rowlet_v137_notify_tick" not in source:
-              raise SystemExit("Gmail diagnostic code missing")
-
-          path.write_text(source)
-
-          print("V13.8.1 HTTP fixes installed")
+          p = Path('3gx/PokeReader.plgInfo')
+          if not p.is_file():
+              raise SystemExit('PokeReader.plgInfo missing')
+          s = p.read_text()
+          if 'UsePrivateMemory:' in s:
+              lines = s.splitlines()
+              matches = [i for i, x in enumerate(lines) if x.strip().startswith('UsePrivateMemory:')]
+              if len(matches) != 1:
+                  raise SystemExit('Ambiguous existing UsePrivateMemory setting')
+              lines[matches[0]] = 'UsePrivateMemory: true'
+              s = '\n'.join(lines) + '\n'
+          else:
+              s = s.rstrip('\n') + '\nUsePrivateMemory: true\n'
+          p.write_text(s)
+          print('Enabled UsePrivateMemory for .3gx plugin networking')
           PY
 
-          python3 /tmp/v1381_fix.py
-
-      - name: Verify source code
+      - name: Verify V13.9 safety gates and private memory
         shell: bash
         run: |
           set -euo pipefail
-
+          grep -Fqx 'UsePrivateMemory: true' 3gx/PokeReader.plgInfo
           grep -Fq 'httpcInit(0x1000)' 3gx/sources/main.c
           grep -Fq 'application/x-www-form-urlencoded' 3gx/sources/main.c
-          grep -Fq 'rowlet_v137_send_mail' 3gx/sources/main.c
           grep -Fq 'rowlet_v137_notify_tick' 3gx/sources/main.c
+          grep -Fq 'if (v13_phase == 4)' 3gx/sources/main.c
           grep -Fq 'rowlet_v13_reset_sent' reader_core/src/gen7/frame.rs
           grep -Fq 'ROWLET: SHINY!' reader_core/src/gen7/frame.rs
           grep -Fq 'NET:{} ERR:{:08X}' reader_core/src/gen7/frame.rs
-
-          echo "V13.8.1 source verification passed"
+          echo 'V13.9 checks passed'
 
       - name: Build PokeReader plugin
         shell: bash
         run: |
           set -o pipefail
-
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            zaksabeast/devkitarm-rust make \
-            2>&1 | tee rowlet_v13_8_1_compile.log
+          docker run --rm -v "$PWD:/work" -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v13_9_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v13-8-1-gmail-fixed
+          name: rowlet-v13-9-private-memory-gmail
           path: out/default.3gx
           if-no-files-found: error
 
@@ -221,6 +126,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v13-8-1-compile-log
-          path: rowlet_v13_8_1_compile.log
+          name: rowlet-v13-9-compile-log
+          path: rowlet_v13_9_compile.log
           if-no-files-found: warn
