@@ -1,5 +1,5 @@
 
-name: Build Rowlet V14.7 Internet Connection Test
+name: Build Rowlet V13.2 Persistent SD Counter
 
 'on':
   workflow_dispatch:
@@ -12,290 +12,418 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout full history
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Restore V13.9 working base
+      - name: Restore working V13.2
         shell: bash
-        env:
-          ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
-          ROWLET_NOTIFY_TOKEN: ${{ secrets.ROWLET_NOTIFY_TOKEN }}
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
-          import os
+          from pathlib import Path
           import subprocess
           import yaml
 
-          filename = ".github/workflows/rowlet_v13_5_gmail_counter.yml"
+          original = Path(
+              ".github/workflows/rowlet_build.yml"
+          )
 
-          for key in ("ROWLET_NOTIFY_URL", "ROWLET_NOTIFY_TOKEN"):
-              if not os.environ.get(key):
-                  raise SystemExit("Missing GitHub secret: " + key)
-
-          commits = subprocess.check_output(
-              ["git", "log", "--all", "--format=%H", "--", filename],
-              text=True
-          ).splitlines()
-
-          previous = None
-
-          for commit in commits:
-              result = subprocess.run(
-                  ["git", "show", f"{commit}:{filename}"],
-                  capture_output=True,
-                  text=True
+          if not original.exists():
+              raise SystemExit(
+                  "Original V13.2 workflow missing"
               )
 
-              if result.returncode:
-                  continue
+          doc = yaml.safe_load(original.read_text())
+          steps = doc["jobs"]["build"]["steps"]
 
-              try:
-                  candidate = yaml.safe_load(result.stdout)
-              except yaml.YAMLError:
-                  continue
+          required = [
+              "Apply V5 decoded Rowlet watcher",
+              "Apply V6 working A-input bridge",
+              "Replace V6 test with V12.1 A pulses and shiny-only status",
+              "Install V13.1 reset loop",
+              "V13.2 nickname keyboard START then A workaround",
+              "Fix toolchain linker compatibility",
+          ]
 
-              if (
-                  isinstance(candidate, dict)
-                  and candidate.get("name") ==
-                  "Build Rowlet V13.9 Private Memory Gmail Fix"
-              ):
-                  previous = candidate
-                  print("Found V13.9:", commit[:12])
-                  break
-
-          if previous is None:
-              raise SystemExit("V13.9 not found in Git history")
-
-          steps = previous["jobs"]["build"]["steps"]
-
-          for name in (
-              "Rebuild V13.8.1 hunting and Gmail source",
-              "Enable private memory in plugin header"
-          ):
+          for name in required:
               matches = [
                   step for step in steps
                   if step.get("name") == name
               ]
 
               if len(matches) != 1:
-                  raise SystemExit("Missing base step: " + name)
+                  raise SystemExit(
+                      "Missing V13.2 step: " + name
+                  )
 
               print("Applying:", name, flush=True)
 
               subprocess.run(
-                  ["bash", "-e", "-o", "pipefail", "-c", matches[0]["run"]],
-                  env=os.environ.copy(),
+                  [
+                      "bash", "-e", "-o", "pipefail",
+                      "-c", matches[0]["run"]
+                  ],
                   check=True
               )
 
-          print("V13.9 base restored")
+          print("Original V13.2 restored")
           PY
 
-      - name: Add standalone internet connection tests
+      - name: Install persistent SD reset counter
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/rowlet147.py <<'PY'
+          cat > /tmp/rowlet_sd_counter.py <<'PY'
           from pathlib import Path
-          import re
 
-          path = Path("3gx/sources/main.c")
-          source = path.read_text()
+          main = Path("3gx/sources/main.c")
+          frame = Path("reader_core/src/gen7/frame.rs")
 
-          # Reuse the existing NET, ERR, and HTTP
-          # diagnostic display from V13.9.
-          # No changes to Rust overlay are needed.
+          m = main.read_text()
+          f = frame.read_text()
 
-          probe = r'''
-          // V14.7 internet test.
-          // Runs only after the hunter has stopped.
-          // Does not modify shiny detection.
+          def once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      f"{label}: expected 1 match, "
+                      f"found {count}"
+                  )
+              return text.replace(old, new, 1)
 
-          static u32 v147_last_test_keys = 0u;
+          counter_code = r'''
+          // V13.2 persistent reset counter.
+          // Stored on SD card, not in Pokemon save data.
 
-          static void rowlet_v147_probe(
-              u32 test_number,
-              const char *url
+          #define ROWLET_COUNT_MAGIC 0x524C5431u
+          #define ROWLET_COUNT_SALT  0xAC57F00Du
+
+          static const char rowlet_count_path[] =
+              "/rowlet_resets.dat";
+
+          static u32 rowlet_count_loaded = 0;
+          static u32 rowlet_fs_ready = 0;
+
+          // 0 = not initialized
+          // 1 = loaded/ready
+          // 2 = saved
+          // 3 = SD error
+          static volatile u32 rowlet_sd_status = 0;
+
+          typedef struct {
+              u32 magic;
+              u32 count;
+              u32 check;
+          } RowletCountRecord;
+
+          u32 rowlet_get_reset_count(void)
+          {
+              return v13_resets;
+          }
+
+          u32 rowlet_get_sd_status(void)
+          {
+              return rowlet_sd_status;
+          }
+
+          static bool rowlet_record_valid(
+              const RowletCountRecord *record
           )
           {
-              // 81 = direct IP test started
-              // 82 = hostname test started
-              // 91 = direct IP received HTTP
-              // 92 = hostname received HTTP
+              return
+                  record->magic == ROWLET_COUNT_MAGIC &&
+                  record->check ==
+                  (record->count ^
+                   ROWLET_COUNT_MAGIC ^
+                   ROWLET_COUNT_SALT);
+          }
 
-              v137_net_stage = 80u + test_number;
-              v137_net_error = 0u;
-              v137_http_status = 0u;
+          static void rowlet_counter_load(void)
+          {
+              if (rowlet_count_loaded)
+                  return;
 
-              Result rc = httpcInit(0x1000);
+              rowlet_count_loaded = 1;
+
+              Result rc = fsInit();
 
               if (R_FAILED(rc)) {
-                  v137_net_error = (u32)rc;
+                  rowlet_sd_status = 3;
                   return;
               }
 
-              httpcContext ctx;
+              rowlet_fs_ready = 1;
+              rowlet_sd_status = 1;
 
-              rc = httpcOpenContext(
-                  &ctx,
-                  HTTPC_METHOD_GET,
-                  url,
-                  1
+              FS_Path archive = {
+                  PATH_EMPTY,
+                  1,
+                  ""
+              };
+
+              FS_Path file = {
+                  PATH_ASCII,
+                  sizeof(rowlet_count_path),
+                  rowlet_count_path
+              };
+
+              Handle handle = 0;
+
+              rc = FSUSER_OpenFileDirectly(
+                  &handle,
+                  ARCHIVE_SDMC,
+                  archive,
+                  file,
+                  FS_OPEN_READ,
+                  0
               );
 
-              if (R_FAILED(rc)) {
-                  v137_net_error = (u32)rc;
-                  httpcExit();
+              // No existing file is normal on first run.
+              if (R_FAILED(rc))
                   return;
-              }
 
-              rc = httpcBeginRequest(&ctx);
+              RowletCountRecord record;
 
-              if (R_SUCCEEDED(rc)) {
-                  u32 status = 0u;
+              u32 highest = 0;
 
-                  rc = httpcGetResponseStatusCode(
-                      &ctx,
-                      &status
+              // Two alternating saved records.
+              // If one write is interrupted, the
+              // previous valid record may survive.
+              for (u32 slot = 0; slot < 2; slot++) {
+                  u32 bytes = 0;
+
+                  rc = FSFILE_Read(
+                      handle,
+                      &bytes,
+                      slot * sizeof(record),
+                      &record,
+                      sizeof(record)
                   );
 
-                  if (R_SUCCEEDED(rc)) {
-                      v137_net_stage = 90u + test_number;
-                      v137_http_status = status;
+                  if (
+                      R_SUCCEEDED(rc) &&
+                      bytes == sizeof(record) &&
+                      rowlet_record_valid(&record)
+                  ) {
+                      if (record.count > highest)
+                          highest = record.count;
                   }
               }
 
-              if (R_FAILED(rc)) {
-                  v137_net_error = (u32)rc;
-              }
+              v13_resets = highest;
 
-              httpcCloseContext(&ctx);
-              httpcExit();
+              FSFILE_Close(handle);
           }
 
-          static void rowlet_v147_test_tick(u32 keys)
+          static void rowlet_counter_save(void)
           {
-              const u32 ip_combo = KEY_SELECT | KEY_L;
-              const u32 dns_combo = KEY_SELECT | KEY_R;
-
-              u32 current = keys & (KEY_SELECT | KEY_L | KEY_R);
-              u32 previous = v147_last_test_keys;
-
-              // Run once per new physical button press.
-              // Do not trigger repeatedly while held down.
-
-              if (
-                  current == ip_combo &&
-                  previous != ip_combo
-              ) {
-                  rowlet_v147_probe(
-                      1u,
-                      "http://1.1.1.1/"
-                  );
+              if (!rowlet_fs_ready) {
+                  rowlet_sd_status = 3;
+                  return;
               }
 
-              if (
-                  current == dns_combo &&
-                  previous != dns_combo
-              ) {
-                  rowlet_v147_probe(
-                      2u,
-                      "http://example.com/"
-                  );
+              FS_Path archive = {
+                  PATH_EMPTY,
+                  1,
+                  ""
+              };
+
+              FS_Path file = {
+                  PATH_ASCII,
+                  sizeof(rowlet_count_path),
+                  rowlet_count_path
+              };
+
+              Handle handle = 0;
+
+              Result rc = FSUSER_OpenFileDirectly(
+                  &handle,
+                  ARCHIVE_SDMC,
+                  archive,
+                  file,
+                  FS_OPEN_WRITE | FS_OPEN_CREATE,
+                  0
+              );
+
+              if (R_FAILED(rc)) {
+                  rowlet_sd_status = 3;
+                  return;
               }
 
-              v147_last_test_keys = current;
+              RowletCountRecord record;
+
+              record.magic = ROWLET_COUNT_MAGIC;
+              record.count = v13_resets;
+              record.check =
+                  record.count ^
+                  ROWLET_COUNT_MAGIC ^
+                  ROWLET_COUNT_SALT;
+
+              // Alternate slots on each reset.
+              u32 slot = record.count & 1u;
+              u32 bytes = 0;
+
+              rc = FSFILE_Write(
+                  handle,
+                  &bytes,
+                  slot * sizeof(record),
+                  &record,
+                  sizeof(record),
+                  FS_WRITE_FLUSH
+              );
+
+              FSFILE_Close(handle);
+
+              if (
+                  R_SUCCEEDED(rc) &&
+                  bytes == sizeof(record)
+              ) {
+                  rowlet_sd_status = 2;
+              } else {
+                  rowlet_sd_status = 3;
+              }
           }
 
           '''
 
-          # Insert the probe before the existing
-          # notification function, then attach the
-          # test at the function's opening brace.
-          #
-          # This avoids fragile line-by-line matching
-          # in the existing PokeReader overlay.
-
-          pattern = (
-              r"static\s+void\s+"
-              r"rowlet_v137_notify_tick"
-              r"\s*\(\s*u32\s+keys\s*\)\s*\{"
+          # Make the existing counter accessible,
+          # and add SD read/write functions.
+          m = once(
+              m,
+              "static void rowlet_v13_tick(void)",
+              counter_code +
+              "static void rowlet_v13_tick(void)",
+              "SD counter insertion"
           )
 
-          matches = list(re.finditer(pattern, source))
+          # Load the counter once per plugin session.
+          m = once(
+              m,
+              "if (get_title_id() != ROWLET_V13_TITLE) return;",
+              """if (get_title_id() != ROWLET_V13_TITLE) return;
 
-          if len(matches) != 1:
-              raise SystemExit(
-                  "Expected exactly one existing "
-                  "notification function, found " +
-                  str(len(matches))
-              )
-
-          match = matches[0]
-
-          old_header = match.group(0)
-
-          new_header = (
-              probe
-              + "\n"
-              + old_header
-              + "\n"
-              + "              rowlet_v147_test_tick(keys);\n"
+              rowlet_counter_load();""",
+              "SD counter initialization"
           )
 
-          source = (
-              source[:match.start()]
-              + new_header
-              + source[match.end():]
+          # Remove the original counter increment,
+          # which happened after the reset chord.
+          m = once(
+              m,
+              """                      v13_resets++;""",
+              """                      // Count was saved before reset.""",
+              "Original counter increment"
           )
 
-          # Preserve the existing hunting controls.
-          for required in (
+          # Now increment and save BEFORE sending
+          # a verified non-shiny soft reset.
+          # This gives the SD write time to finish.
+          old = '''if (v13_phase == 4) {
+                      rowlet_try_release_a_frame();'''
+
+          new = '''if (v13_phase == 4) {
+                      v13_resets++;
+                      rowlet_counter_save();
+                      rowlet_try_release_a_frame();'''
+
+          m = once(
+              m,
+              old,
+              new,
+              "Safe reset count and save"
+          )
+
+          # On-screen display.
+          display = '''pnp::println!("{}", label);
+
+                  extern "C" {
+                      fn rowlet_get_reset_count() -> u32;
+                      fn rowlet_get_sd_status() -> u32;
+                  }
+
+                  let resets = unsafe {
+                      rowlet_get_reset_count()
+                  };
+
+                  let sd = unsafe {
+                      rowlet_get_sd_status()
+                  };
+
+                  pnp::println!("RESETS: {}", resets);
+
+                  let sd_label = match sd {
+                      0 => "SD: STARTING",
+                      1 => "SD: READY",
+                      2 => "SD: SAVED",
+                      _ => "SD: ERROR",
+                  };
+
+                  pnp::println!("{}", sd_label);'''
+
+          f = once(
+              f,
+              'pnp::println!("{}", label);',
+              display,
+              "Counter display"
+          )
+
+          # Check the original hunting logic.
+          required_main = [
               "if (v13_phase == 4)",
+              "if (v13_phase == 5 || v13_phase == 6)",
               "rowlet_v13_halt();",
-              "rowlet_v137_send_mail",
-              "rowlet_v137_notify_tick",
-              "rowlet_v147_test_tick(keys);",
-              "rowlet_try_nickname_start_frame"
-          ):
-              if required not in source:
+              "rowlet_try_nickname_start_frame",
+              "rowlet_counter_save();",
+              "rowlet_counter_load();",
+          ]
+
+          for marker in required_main:
+              if marker not in m:
                   raise SystemExit(
-                      "Required source missing: " + required
+                      "Missing hunting code: " + marker
                   )
 
-          path.write_text(source)
+          if "rowlet_v13_reset_sent" not in f:
+              raise SystemExit(
+                  "Original reset guard missing"
+              )
 
-          print("V14.7 internet tests installed")
+          if "ROWLET: SHINY!" not in f:
+              raise SystemExit(
+                  "Shiny display missing"
+              )
+
+          main.write_text(m)
+          frame.write_text(f)
+
+          print("Persistent SD counter installed")
           PY
 
-          python3 /tmp/rowlet147.py
+          python3 /tmp/rowlet_sd_counter.py
 
-      - name: Verify V14.7
+      - name: Verify hunting and counter code
         shell: bash
         run: |
           set -euo pipefail
 
-          grep -Fq 'UsePrivateMemory: true' \
-            3gx/PokeReader.plgInfo
-
-          grep -Fq 'rowlet_v147_probe' \
+          grep -Fq 'rowlet_v13_tick();' \
             3gx/sources/main.c
 
-          grep -Fq 'rowlet_v147_test_tick(keys);' \
+          grep -Fq 'rowlet_counter_save();' \
             3gx/sources/main.c
 
-          grep -Fq 'http://1.1.1.1/' \
+          grep -Fq 'rowlet_counter_load();' \
             3gx/sources/main.c
 
-          grep -Fq 'http://example.com/' \
+          grep -Fq 'FSFILE_Write' \
             3gx/sources/main.c
 
-          grep -Fq 'if (v13_phase == 4)' \
+          grep -Fq 'rowlet_resets.dat' \
+            3gx/sources/main.c
+
+          grep -Fq 'rowlet_try_nickname_start_frame' \
             3gx/sources/main.c
 
           grep -Fq 'rowlet_v13_reset_sent' \
@@ -304,10 +432,13 @@ jobs:
           grep -Fq 'ROWLET: SHINY!' \
             reader_core/src/gen7/frame.rs
 
-          grep -Fq 'NET:{} ERR:{:08X}' \
+          grep -Fq 'RESETS: {}' \
             reader_core/src/gen7/frame.rs
 
-          echo "V14.7 source checks passed"
+          grep -Fq 'SD: SAVED' \
+            reader_core/src/gen7/frame.rs
+
+          echo "SD counter checks passed"
 
       - name: Build PokeReader plugin
         shell: bash
@@ -318,13 +449,13 @@ jobs:
             -v "$PWD:/work" \
             -w /work \
             zaksabeast/devkitarm-rust make \
-            2>&1 | tee rowlet_v14_7_compile.log
+            2>&1 | tee rowlet_sd_counter_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v14-7-connection-test
+          name: rowlet-v13-2-persistent-sd-counter
           path: out/default.3gx
           if-no-files-found: error
 
@@ -332,6 +463,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v14-7-compile-log
-          path: rowlet_v14_7_compile.log
+          name: rowlet-sd-counter-compile-log
+          path: rowlet_sd_counter_compile.log
           if-no-files-found: warn
