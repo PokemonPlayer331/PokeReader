@@ -1,5 +1,5 @@
 
-name: Build Rowlet V14.6 Network Probe Display Fix
+name: Build Rowlet V14.7 Internet Connection Test
 
 'on':
   workflow_dispatch:
@@ -10,167 +10,136 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout full history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Restore V13.9 tested base
+      - name: Restore V13.9 working base
         shell: bash
         env:
           ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
           ROWLET_NOTIFY_TOKEN: ${{ secrets.ROWLET_NOTIFY_TOKEN }}
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
-          import os, subprocess, yaml
+          import os
+          import subprocess
+          import yaml
 
-          filename = '.github/workflows/rowlet_v13_5_gmail_counter.yml'
+          filename = ".github/workflows/rowlet_v13_5_gmail_counter.yml"
 
-          for key in ('ROWLET_NOTIFY_URL', 'ROWLET_NOTIFY_TOKEN'):
+          for key in ("ROWLET_NOTIFY_URL", "ROWLET_NOTIFY_TOKEN"):
               if not os.environ.get(key):
-                  raise SystemExit('Missing Actions secret ' + key)
+                  raise SystemExit("Missing GitHub secret: " + key)
 
           commits = subprocess.check_output(
-              ['git', 'log', '--all', '--format=%H', '--', filename],
+              ["git", "log", "--all", "--format=%H", "--", filename],
               text=True
           ).splitlines()
 
-          candidate = None
+          previous = None
 
-          for sha in commits:
-              item = subprocess.run(
-                  ['git', 'show', f'{sha}:{filename}'],
-                  capture_output=True, text=True
+          for commit in commits:
+              result = subprocess.run(
+                  ["git", "show", f"{commit}:{filename}"],
+                  capture_output=True,
+                  text=True
               )
 
-              if item.returncode:
+              if result.returncode:
                   continue
 
               try:
-                  doc = yaml.safe_load(item.stdout)
+                  candidate = yaml.safe_load(result.stdout)
               except yaml.YAMLError:
                   continue
 
               if (
-                  isinstance(doc, dict)
-                  and doc.get('name') ==
-                  'Build Rowlet V13.9 Private Memory Gmail Fix'
+                  isinstance(candidate, dict)
+                  and candidate.get("name") ==
+                  "Build Rowlet V13.9 Private Memory Gmail Fix"
               ):
-                  candidate = doc
-                  print('Recovered V13.9 from', sha[:12])
+                  previous = candidate
+                  print("Found V13.9:", commit[:12])
                   break
 
-          if candidate is None:
-              raise SystemExit(
-                  'V13.9 is not in this file history'
-              )
+          if previous is None:
+              raise SystemExit("V13.9 not found in Git history")
 
-          steps = candidate['jobs']['build']['steps']
+          steps = previous["jobs"]["build"]["steps"]
 
-          required = (
-              'Rebuild V13.8.1 hunting and Gmail source',
-              'Enable private memory in plugin header'
-          )
-
-          for name in required:
+          for name in (
+              "Rebuild V13.8.1 hunting and Gmail source",
+              "Enable private memory in plugin header"
+          ):
               matches = [
                   step for step in steps
-                  if step.get('name') == name
+                  if step.get("name") == name
               ]
 
               if len(matches) != 1:
-                  raise SystemExit(
-                      'Missing V13.9 build step: ' + name
-                  )
+                  raise SystemExit("Missing base step: " + name)
 
-              print('Applying', name, flush=True)
+              print("Applying:", name, flush=True)
 
               subprocess.run(
-                  [
-                      'bash', '-e', '-o', 'pipefail',
-                      '-c', matches[0]['run']
-                  ],
-                  check=True,
-                  env=os.environ.copy()
+                  ["bash", "-e", "-o", "pipefail", "-c", matches[0]["run"]],
+                  env=os.environ.copy(),
+                  check=True
               )
+
+          print("V13.9 base restored")
           PY
 
-      - name: Add isolated IP and DNS tests
+      - name: Add standalone internet connection tests
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/v146_patch.py <<'PY'
+          cat > /tmp/rowlet147.py <<'PY'
           from pathlib import Path
           import re
 
-          main = Path('3gx/sources/main.c')
-          frame = Path('reader_core/src/gen7/frame.rs')
+          path = Path("3gx/sources/main.c")
+          source = path.read_text()
 
-          m = main.read_text()
-          f = frame.read_text()
+          # Reuse the existing NET, ERR, and HTTP
+          # diagnostic display from V13.9.
+          # No changes to Rust overlay are needed.
 
-          def once(s, old, new, label):
-              n = s.count(old)
+          probe = r'''
+          // V14.7 internet test.
+          // Runs only after the hunter has stopped.
+          // Does not modify shiny detection.
 
-              if n != 1:
-                  raise SystemExit(
-                      '%s: expected one match, got %d'
-                      % (label, n)
-                  )
+          static u32 v147_last_test_keys = 0u;
 
-              return s.replace(old, new, 1)
-
-          network_test = r'''
-          // V14.6: manual network tests.
-          // Never called during normal hunting.
-
-          static volatile u32 v146_stage[2] = {0,0};
-          static volatile u32 v146_error[2] = {0,0};
-          static volatile u32 v146_http[2] = {0,0};
-
-          static u32 v146_l_held = 0;
-          static u32 v146_r_held = 0;
-
-          u32 rowlet_v146_stage(u32 n)
-          {
-              return n < 2 ? v146_stage[n] : 0;
-          }
-
-          u32 rowlet_v146_error(u32 n)
-          {
-              return n < 2 ? v146_error[n] : 0;
-          }
-
-          u32 rowlet_v146_http(u32 n)
-          {
-              return n < 2 ? v146_http[n] : 0;
-          }
-
-          static void rowlet_v146_test(
-              u32 n,
+          static void rowlet_v147_probe(
+              u32 test_number,
               const char *url
           )
           {
-              if (n >= 2)
-                  return;
+              // 81 = direct IP test started
+              // 82 = hostname test started
+              // 91 = direct IP received HTTP
+              // 92 = hostname received HTTP
 
-              v146_stage[n] = 1;
-              v146_error[n] = 0;
-              v146_http[n] = 0;
+              v137_net_stage = 80u + test_number;
+              v137_net_error = 0u;
+              v137_http_status = 0u;
 
               Result rc = httpcInit(0x1000);
 
               if (R_FAILED(rc)) {
-                  v146_error[n] = (u32)rc;
+                  v137_net_error = (u32)rc;
                   return;
               }
 
               httpcContext ctx;
-
-              v146_stage[n] = 2;
 
               rc = httpcOpenContext(
                   &ctx,
@@ -180,19 +149,15 @@ jobs:
               );
 
               if (R_FAILED(rc)) {
-                  v146_error[n] = (u32)rc;
+                  v137_net_error = (u32)rc;
                   httpcExit();
                   return;
               }
 
-              v146_stage[n] = 3;
-
               rc = httpcBeginRequest(&ctx);
 
               if (R_SUCCEEDED(rc)) {
-                  v146_stage[n] = 4;
-
-                  u32 status = 0;
+                  u32 status = 0u;
 
                   rc = httpcGetResponseStatusCode(
                       &ctx,
@@ -200,149 +165,117 @@ jobs:
                   );
 
                   if (R_SUCCEEDED(rc)) {
-                      v146_stage[n] = 5;
-                      v146_http[n] = status;
+                      v137_net_stage = 90u + test_number;
+                      v137_http_status = status;
                   }
               }
 
               if (R_FAILED(rc)) {
-                  v146_error[n] = (u32)rc;
+                  v137_net_error = (u32)rc;
               }
 
               httpcCloseContext(&ctx);
               httpcExit();
           }
 
-          static void rowlet_v146_test_tick(u32 keys)
+          static void rowlet_v147_test_tick(u32 keys)
           {
-              // Called only in the stopped-mode
-              // notification handler.
+              const u32 ip_combo = KEY_SELECT | KEY_L;
+              const u32 dns_combo = KEY_SELECT | KEY_R;
 
-              u32 l =
-                  (keys & (KEY_SELECT | KEY_L)) ==
-                  (KEY_SELECT | KEY_L);
+              u32 current = keys & (KEY_SELECT | KEY_L | KEY_R);
+              u32 previous = v147_last_test_keys;
 
-              u32 r =
-                  (keys & (KEY_SELECT | KEY_R)) ==
-                  (KEY_SELECT | KEY_R);
+              // Run once per new physical button press.
+              // Do not trigger repeatedly while held down.
 
-              if (l && !v146_l_held) {
-                  rowlet_v146_test(
-                      0,
+              if (
+                  current == ip_combo &&
+                  previous != ip_combo
+              ) {
+                  rowlet_v147_probe(
+                      1u,
                       "http://1.1.1.1/"
                   );
               }
 
-              if (r && !v146_r_held) {
-                  rowlet_v146_test(
-                      1,
+              if (
+                  current == dns_combo &&
+                  previous != dns_combo
+              ) {
+                  rowlet_v147_probe(
+                      2u,
                       "http://example.com/"
                   );
               }
 
-              v146_l_held = l;
-              v146_r_held = r;
+              v147_last_test_keys = current;
           }
+
           '''
 
-          m = once(
-              m,
-              'static bool rowlet_v137_send_mail(void)',
-              network_test +
-              '\nstatic bool rowlet_v137_send_mail(void)',
-              'probe insertion'
-          )
+          # Insert the probe before the existing
+          # notification function, then attach the
+          # test at the function's opening brace.
+          #
+          # This avoids fragile line-by-line matching
+          # in the existing PokeReader overlay.
 
-          # Insert directly into the existing
-          # notification function.
           pattern = (
-              r'(static\s+void\s+'
-              r'rowlet_v137_notify_tick\s*'
-              r'\(\s*u32\s+keys\s*\)\s*\{)'
+              r"static\s+void\s+"
+              r"rowlet_v137_notify_tick"
+              r"\s*\(\s*u32\s+keys\s*\)\s*\{"
           )
 
-          m, count = re.subn(
-              pattern,
-              lambda x: (
-                  x.group(1) +
-                  '\n              rowlet_v146_test_tick(keys);'
-              ),
-              m,
-              count=1
-          )
+          matches = list(re.finditer(pattern, source))
 
-          if count != 1:
+          if len(matches) != 1:
               raise SystemExit(
-                  'Could not find V13.9 notifier function'
+                  "Expected exactly one existing "
+                  "notification function, found " +
+                  str(len(matches))
               )
 
-          # Use the existing MAIL display instead
-          # of the fragile HTTP display anchor.
+          match = matches[0]
 
-          display = '''extern "C" {
-                      fn rowlet_v146_stage(i: u32) -> u32;
-                      fn rowlet_v146_error(i: u32) -> u32;
-                      fn rowlet_v146_http(i: u32) -> u32;
-                  }
+          old_header = match.group(0)
 
-                  let (i1, e1, h1, i2, e2, h2) =
-                      unsafe {
-                          (
-                              rowlet_v146_stage(0),
-                              rowlet_v146_error(0),
-                              rowlet_v146_http(0),
-                              rowlet_v146_stage(1),
-                              rowlet_v146_error(1),
-                              rowlet_v146_http(1)
-                          )
-                      };
-
-                  pnp::println!(
-                      "IP:{} E:{:08X} H:{}",
-                      i1, e1, h1
-                  );
-
-                  pnp::println!(
-                      "DNS:{} E:{:08X} H:{}",
-                      i2, e2, h2
-                  );
-                  '''
-
-          f = once(
-              f,
-              'pnp::println!("{}", mail_text);',
-              'pnp::println!("{}", mail_text);\n'
-              '                  ' + display,
-              'overlay insertion'
+          new_header = (
+              probe
+              + "\n"
+              + old_header
+              + "\n"
+              + "              rowlet_v147_test_tick(keys);\n"
           )
 
-          for marker in (
-              'if (v13_phase == 4)',
-              'rowlet_v137_notify_tick',
-              'rowlet_v13_halt();'
+          source = (
+              source[:match.start()]
+              + new_header
+              + source[match.end():]
+          )
+
+          # Preserve the existing hunting controls.
+          for required in (
+              "if (v13_phase == 4)",
+              "rowlet_v13_halt();",
+              "rowlet_v137_send_mail",
+              "rowlet_v137_notify_tick",
+              "rowlet_v147_test_tick(keys);",
+              "rowlet_try_nickname_start_frame"
           ):
-              if marker not in m:
+              if required not in source:
                   raise SystemExit(
-                      'Safety marker missing: ' + marker
+                      "Required source missing: " + required
                   )
 
-          if (
-              'rowlet_v13_reset_sent' not in f
-              or 'ROWLET: SHINY!' not in f
-          ):
-              raise SystemExit(
-                  'Rust shiny/reset guard missing'
-              )
+          path.write_text(source)
 
-          main.write_text(m)
-          frame.write_text(f)
-
-          print('V14.6 diagnostics installed')
+          print("V14.7 internet tests installed")
           PY
 
-          python3 /tmp/v146_patch.py
+          python3 /tmp/rowlet147.py
 
-      - name: Verify V14.6 source
+      - name: Verify V14.7
         shell: bash
         run: |
           set -euo pipefail
@@ -350,10 +283,16 @@ jobs:
           grep -Fq 'UsePrivateMemory: true' \
             3gx/PokeReader.plgInfo
 
-          grep -Fq 'rowlet_v146_test_tick(keys);' \
+          grep -Fq 'rowlet_v147_probe' \
             3gx/sources/main.c
 
-          grep -Fq 'rowlet_v137_send_mail' \
+          grep -Fq 'rowlet_v147_test_tick(keys);' \
+            3gx/sources/main.c
+
+          grep -Fq 'http://1.1.1.1/' \
+            3gx/sources/main.c
+
+          grep -Fq 'http://example.com/' \
             3gx/sources/main.c
 
           grep -Fq 'if (v13_phase == 4)' \
@@ -362,15 +301,15 @@ jobs:
           grep -Fq 'rowlet_v13_reset_sent' \
             reader_core/src/gen7/frame.rs
 
-          grep -Fq 'IP:{} E:{:08X} H:{}' \
+          grep -Fq 'ROWLET: SHINY!' \
             reader_core/src/gen7/frame.rs
 
-          grep -Fq 'DNS:{} E:{:08X} H:{}' \
+          grep -Fq 'NET:{} ERR:{:08X}' \
             reader_core/src/gen7/frame.rs
 
-          echo 'V14.6 checks passed'
+          echo "V14.7 source checks passed"
 
-      - name: Compile plugin
+      - name: Build PokeReader plugin
         shell: bash
         run: |
           set -o pipefail
@@ -379,13 +318,13 @@ jobs:
             -v "$PWD:/work" \
             -w /work \
             zaksabeast/devkitarm-rust make \
-            2>&1 | tee rowlet_v14_6_compile.log
+            2>&1 | tee rowlet_v14_7_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v14-6-network-tests
+          name: rowlet-v14-7-connection-test
           path: out/default.3gx
           if-no-files-found: error
 
@@ -393,6 +332,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v14-6-compile-log
-          path: rowlet_v14_6_compile.log
+          name: rowlet-v14-7-compile-log
+          path: rowlet_v14_7_compile.log
           if-no-files-found: warn
