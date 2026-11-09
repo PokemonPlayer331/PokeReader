@@ -1,5 +1,5 @@
 
-name: Build Rowlet V13.7 Gmail Network Diagnostics
+name: Build Rowlet V13.8 Gmail POST Fix
 
 'on':
   workflow_dispatch:
@@ -10,575 +10,128 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Restore working V13.2 hunting code
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import subprocess
-          import yaml
-
-          path = Path(".github/workflows/rowlet_build.yml")
-
-          if not path.exists():
-              raise SystemExit("Working V13.2 workflow not found")
-
-          doc = yaml.safe_load(path.read_text())
-          steps = doc["jobs"]["build"]["steps"]
-
-          names = [
-              "Apply V5 decoded Rowlet watcher",
-              "Apply V6 working A-input bridge",
-              "Replace V6 test with V12.1 A pulses and shiny-only status",
-              "Install V13.1 reset loop",
-              "V13.2 nickname keyboard START then A workaround",
-              "Fix toolchain linker compatibility",
-          ]
-
-          for name in names:
-              matches = [
-                  step for step in steps
-                  if step.get("name") == name
-              ]
-
-              if len(matches) != 1:
-                  raise SystemExit("Missing V13.2 step: " + name)
-
-              print("Applying " + name, flush=True)
-
-              subprocess.run(
-                  [
-                      "bash",
-                      "-e",
-                      "-o",
-                      "pipefail",
-                      "-c",
-                      matches[0]["run"],
-                  ],
-                  check=True,
-              )
-
-          print("V13.2 restored successfully")
-          PY
-
-      - name: Install V13.7 counter and Gmail diagnostics
+      - name: Restore V13.7 working hunter and diagnostics
         shell: bash
         env:
           ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
           ROWLET_NOTIFY_TOKEN: ${{ secrets.ROWLET_NOTIFY_TOKEN }}
-
         run: |
           set -euo pipefail
-
-          if [ -z "$ROWLET_NOTIFY_URL" ] || [ -z "$ROWLET_NOTIFY_TOKEN" ]; then
-            echo "Missing notification secrets"
-            exit 1
-          fi
-
-          cat > /tmp/rowlet137.py <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
-          import json
           import os
-
-          main = Path("3gx/sources/main.c")
-          frame = Path("reader_core/src/gen7/frame.rs")
-
-          m = main.read_text()
-          f = frame.read_text()
-
-          url = os.environ["ROWLET_NOTIFY_URL"].strip()
-          token = os.environ["ROWLET_NOTIFY_TOKEN"].strip()
-
-          if not (
-              url.startswith("https://script.google.com/macros/s/")
-              and url.endswith("/exec")
-          ):
-              raise SystemExit("Invalid Google Apps Script URL")
-
-          if len(token) < 20:
-              raise SystemExit("Notification token too short")
-
-          def replace_once(source, old, new, label):
-              count = source.count(old)
-              if count != 1:
-                  raise SystemExit(
-                      label + ": expected one anchor, found " +
-                      str(count)
-                  )
-              return source.replace(old, new, 1)
-
-          # -----------------------------------
-          # Reset counter and stop reason
-          # -----------------------------------
-
-          m = replace_once(
-              m,
-              "static u32 v13_resets = 0;",
-              """static u32 v13_resets = 0;
-
-          static volatile u32 v137_stop_reason = 0;
-
-          u32 rowlet_v137_count(void)
-          {
-              return v13_resets;
-          }
-
-          u32 rowlet_v137_reason(void)
-          {
-              return v137_stop_reason;
-          }
-
-          u32 rowlet_v137_mode(void)
-          {
-              return v13_mode;
-          }
-          """,
-              "Counter insertion"
-          )
-
-          m = replace_once(
-              m,
-              "if (keys & KEY_B) { rowlet_v13_halt(); return; }",
-              """if (keys & KEY_B) {
-                  v137_stop_reason = 1;
-                  rowlet_v13_halt();
-                  return;
-              }""",
-              "Manual stop"
-          )
-
-          m = replace_once(
-              m,
-              """if (v13_phase == 5 || v13_phase == 6) { // SHINY or ERROR
-                  rowlet_v13_halt();
-                  return;
-              }""",
-              """if (v13_phase == 5 || v13_phase == 6) {
-                  v137_stop_reason =
-                      (v13_phase == 5) ? 2u : 3u;
-
-                  // Stop all automated buttons first.
-                  rowlet_v13_halt();
-
-                  // Networking is attempted only after stopping.
-                  rowlet_v137_notify_tick(keys);
-                  return;
-              }""",
-              "Shiny stop"
-          )
-
-          m = replace_once(
-              m,
-              "if (++v13_missing_hid > 600) rowlet_v13_halt();",
-              """if (++v13_missing_hid > 600) {
-                  v137_stop_reason = 4;
-                  rowlet_v13_halt();
-              }""",
-              "Input failure"
-          )
-
-          m = replace_once(
-              m,
-              "if (++v13_frame > 600) rowlet_v13_halt();",
-              """if (++v13_frame > 600) {
-                      v137_stop_reason = 5;
-                      rowlet_v13_halt();
-                  }""",
-              "Trigger timeout"
-          )
-
-          m = replace_once(
-              m,
-              """if (v13_frame > (60u * 240u)) { // 4-minute encounter timeout
-                      rowlet_v13_halt();""",
-              """if (v13_frame > (60u * 240u)) {
-                      v137_stop_reason = 6;
-                      rowlet_v13_halt();""",
-              "Encounter timeout"
-          )
-
-          m = replace_once(
-              m,
-              """if (v13_frame > (60u * 100u)) { // reload failed; no more resets
-                      rowlet_v13_halt();""",
-              """if (v13_frame > (60u * 100u)) {
-                      v137_stop_reason = 7;
-                      rowlet_v13_halt();""",
-              "Reload timeout"
-          )
-
-          # -----------------------------------
-          # Gmail HTTP diagnostics
-          # -----------------------------------
-
-          notifier = r'''
-          #define ROWLET_GMAIL_URL @@URL@@
-          #define ROWLET_GMAIL_TOKEN @@TOKEN@@
-
-          // Mail:
-          // 0 idle
-          // 1 pending
-          // 2 sending
-          // 3 HTTP accepted
-          // 4 failed/retrying
-
-          static volatile u32 v137_mail = 0;
-
-          // Network stages:
-          // 0 no test yet
-          // 1 httpcInit
-          // 2 httpcOpenContext
-          // 3 httpcAddPostDataAscii
-          // 4 httpcBeginRequest
-          // 5 httpcGetResponseStatusCode
-          // 6 HTTP response received
-          // 7 accepted HTTP response
-
-          static volatile u32 v137_net_stage = 0;
-          static volatile u32 v137_net_error = 0;
-          static volatile u32 v137_http_status = 0;
-
-          static u32 v137_mail_frames = 3600;
-          static u32 v137_test_held = 0;
-          static u32 v137_attempts = 0;
-
-          u32 rowlet_v137_mail(void)
-          {
-              return v137_mail;
-          }
-
-          u32 rowlet_v137_stage(void)
-          {
-              return v137_net_stage;
-          }
-
-          u32 rowlet_v137_error(void)
-          {
-              return v137_net_error;
-          }
-
-          u32 rowlet_v137_http(void)
-          {
-              return v137_http_status;
-          }
-
-          u32 rowlet_v137_attempts(void)
-          {
-              return v137_attempts;
-          }
-
-          static bool rowlet_v137_send_mail(void)
-          {
-              v137_net_stage = 1u;
-              v137_net_error = 0u;
-              v137_http_status = 0u;
-
-              Result rc = httpcInit(0);
-
-              if (R_FAILED(rc)) {
-                  v137_net_error = (u32)rc;
-                  return false;
-              }
-
-              httpcContext ctx;
-
-              v137_net_stage = 2u;
-
-              rc = httpcOpenContext(
-                  &ctx,
-                  HTTPC_METHOD_POST,
-                  ROWLET_GMAIL_URL,
-                  1
-              );
-
-              if (R_FAILED(rc)) {
-                  v137_net_error = (u32)rc;
-                  httpcExit();
-                  return false;
-              }
-
-              v137_net_stage = 3u;
-
-              rc = httpcAddPostDataAscii(
-                  &ctx,
-                  "token",
-                  ROWLET_GMAIL_TOKEN
-              );
-
-              if (R_FAILED(rc)) {
-                  v137_net_error = (u32)rc;
-                  httpcCloseContext(&ctx);
-                  httpcExit();
-                  return false;
-              }
-
-              v137_net_stage = 4u;
-
-              rc = httpcBeginRequest(&ctx);
-
-              if (R_FAILED(rc)) {
-                  v137_net_error = (u32)rc;
-                  httpcCloseContext(&ctx);
-                  httpcExit();
-                  return false;
-              }
-
-              v137_net_stage = 5u;
-
-              u32 status = 0;
-
-              rc = httpcGetResponseStatusCode(
-                  &ctx,
-                  &status
-              );
-
-              if (R_FAILED(rc)) {
-                  v137_net_error = (u32)rc;
-                  httpcCloseContext(&ctx);
-                  httpcExit();
-                  return false;
-              }
-
-              v137_net_stage = 6u;
-              v137_http_status = status;
-
-              httpcCloseContext(&ctx);
-              httpcExit();
-
-              if (status == 200u ||
-                  status == 302u ||
-                  status == 303u) {
-
-                  v137_net_stage = 7u;
-                  return true;
-              }
-
-              // Non-successful HTTP status.
-              // Preserve it separately for the display.
-              return false;
-          }
-
-          static void rowlet_v137_notify_tick(u32 keys)
-          {
-              // Shiny detection never depends on networking.
-              // All inputs are stopped before this runs.
-
-              if (v13_phase == 5u &&
-                  v137_mail != 3u &&
-                  v137_mail != 2u &&
-                  v137_mail == 0u) {
-                  v137_mail = 1u;
-                  v137_mail_frames = 3600u;
-              }
-
-              // Manual test: stop hunting with B,
-              // then press SELECT + Y.
-              u32 test_down =
-                  ((keys & (KEY_SELECT | KEY_Y)) ==
-                   (KEY_SELECT | KEY_Y));
-
-              if (test_down && !v137_test_held) {
-                  v137_mail = 1u;
-                  v137_mail_frames = 3600u;
-                  v137_net_stage = 0u;
-                  v137_net_error = 0u;
-                  v137_http_status = 0u;
-              }
-
-              v137_test_held = test_down;
-
-              if (v137_mail != 1u &&
-                  v137_mail != 4u) {
-                  return;
-              }
-
-              // Retry approximately once per minute
-              // while the plugin keeps running.
-              if (v137_mail_frames < 3600u) {
-                  ++v137_mail_frames;
-                  return;
-              }
-
-              v137_mail_frames = 0u;
-              v137_mail = 2u;
-              ++v137_attempts;
-
-              bool ok = rowlet_v137_send_mail();
-
-              v137_mail = ok ? 3u : 4u;
-          }
-
-          '''
-
-          notifier = notifier.replace(
-              "@@URL@@",
-              json.dumps(url)
-          ).replace(
-              "@@TOKEN@@",
-              json.dumps(token)
-          )
-
-          m = replace_once(
-              m,
-              "static void rowlet_v13_tick(void)",
-              notifier + "static void rowlet_v13_tick(void)",
-              "Notification insertion"
-          )
-
-          # Once the hunter has stopped, allow mail retries.
-          # Normal hunting still uses the V13.2 behavior.
-
-          m = replace_once(
-              m,
-              "if (v13_mode == 5) return;",
-              """if (v13_mode == 5) {
-                  rowlet_v137_notify_tick(keys);
-                  return;
-              }""",
-              "Stopped mode"
-          )
-
-          # -----------------------------------
-          # Status display
-          # -----------------------------------
-
-          display = '''pnp::println!("{}", label);
-
-                  extern "C" {
-                      fn rowlet_v137_count() -> u32;
-                      fn rowlet_v137_reason() -> u32;
-                      fn rowlet_v137_mode() -> u32;
-                      fn rowlet_v137_mail() -> u32;
-                      fn rowlet_v137_stage() -> u32;
-                      fn rowlet_v137_error() -> u32;
-                      fn rowlet_v137_http() -> u32;
-                      fn rowlet_v137_attempts() -> u32;
-                  }
-
-                  let (
-                      count,
-                      reason,
-                      mode,
-                      mail,
-                      stage,
-                      error,
-                      http,
-                      attempts
-                  ) = unsafe {
-                      (
-                          rowlet_v137_count(),
-                          rowlet_v137_reason(),
-                          rowlet_v137_mode(),
-                          rowlet_v137_mail(),
-                          rowlet_v137_stage(),
-                          rowlet_v137_error(),
-                          rowlet_v137_http(),
-                          rowlet_v137_attempts(),
-                      )
-                  };
-
-                  pnp::println!("RESETS: {}", count);
-
-                  if mode == 5 {
-                      let why = match reason {
-                          1 => "B BUTTON",
-                          2 => "SHINY!",
-                          3 => "DATA ERROR",
-                          4 => "INPUT FAIL",
-                          5 => "TRIGGER TIMEOUT",
-                          6 => "ENCOUNTER TIMEOUT",
-                          7 => "RELOAD TIMEOUT",
-                          _ => "STOPPED",
-                      };
-
-                      pnp::println!("STOP: {}", why);
-                  }
-
-                  let mail_text = match mail {
-                      0 => "IDLE",
-                      1 => "PENDING",
-                      2 => "SENDING",
-                      3 => "REQUEST SENT",
-                      _ => "RETRYING",
-                  };
-
-                  pnp::println!("MAIL: {}", mail_text);
-
-                  pnp::println!(
-                      "NET:{} ERR:{:08X}",
-                      stage,
-                      error
-                  );
-
-                  pnp::println!(
-                      "HTTP:{} TRY:{}",
-                      http,
-                      attempts
-                  );
-          '''
-
-          f = replace_once(
-              f,
-              'pnp::println!("{}", label);',
-              display,
-              "Overlay insertion"
-          )
-
-          # Ensure original shiny safety survived.
-          assert "if (v13_phase == 4)" in m
-          assert "rowlet_v13_halt();" in m
-          assert "rowlet_v13_reset_sent" in f
-          assert "rowlet_try_nickname_start_frame" in m
-          assert "rowlet_v137_notify_tick" in m
-
-          main.write_text(m)
-          frame.write_text(f)
-
-          print("V13.7 diagnostics installed")
+          import subprocess
+          import yaml
+
+          if not os.environ.get('ROWLET_NOTIFY_URL') or not os.environ.get('ROWLET_NOTIFY_TOKEN'):
+              raise SystemExit('GitHub secrets ROWLET_NOTIFY_URL and ROWLET_NOTIFY_TOKEN are required')
+
+          source = Path('.github/workflows/rowlet_v13_5_gmail_counter.yml')
+          if not source.is_file():
+              raise SystemExit('V13.7 workflow is missing. Keep rowlet_v13_5_gmail_counter.yml unchanged.')
+
+          steps = yaml.safe_load(source.read_text())['jobs']['build']['steps']
+          names = [
+              'Restore working V13.2 hunting code',
+              'Install V13.7 counter and Gmail diagnostics',
+          ]
+
+          for name in names:
+              matches = [step for step in steps if step.get('name') == name]
+              if len(matches) != 1:
+                  raise SystemExit('Expected a V13.7 step, not another version: ' + name)
+              print('Applying:', name, flush=True)
+              subprocess.run(
+                  ['bash', '-e', '-o', 'pipefail', '-c', matches[0]['run']],
+                  check=True,
+                  env=os.environ.copy()
+              )
           PY
 
-          python3 /tmp/rowlet137.py
-
-      - name: Verify V13.7 code
+      - name: Fix missing POST buffer and form content type
         shell: bash
         run: |
           set -euo pipefail
+          cat > /tmp/rowlet_v138_fix.py <<'PY'
+          from pathlib import Path
+          import re
 
-          grep -Fq 'rowlet_v137_send_mail' 3gx/sources/main.c
+          path = Path('3gx/sources/main.c')
+          source = path.read_text()
+
+          old_init = 'Result rc = httpcInit(0);'
+          if source.count(old_init) != 1:
+              raise SystemExit('Expected one V13.7 HTTP initialization call')
+
+          source = source.replace(
+              old_init,
+              'Result rc = httpcInit(0x1000);',
+              1
+          )
+
+          # Allocate a 4 KiB shared buffer for POST form data.
+          # Add the required form Content-Type before posting.
+
+          pattern = r'(?m)^([ \t]*)rc = httpcAddPostDataAscii\('
+
+          def insert_header(match):
+              indent = match.group(1)
+              return (
+                  indent + 'rc = httpcAddRequestHeaderField(\n' +
+                  indent + '    &ctx, "Content-Type", "application/x-www-form-urlencoded");\n' +
+                  indent + 'if (R_SUCCEEDED(rc))\n' +
+                  indent + '    rc = httpcAddPostDataAscii('
+              )
+
+          source, found = re.subn(
+              pattern,
+              insert_header,
+              source,
+              count=1
+          )
+
+          if found != 1:
+              raise SystemExit('Expected one V13.7 POST field call')
+
+          if (
+              'if (v13_phase == 4)' not in source
+              or 'rowlet_v137_notify_tick' not in source
+          ):
+              raise SystemExit('Hunting/shiny safety anchors missing')
+
+          path.write_text(source)
+          print('Fixed HTTP 4 KiB POST buffer and Content-Type header')
+          PY
+          python3 /tmp/rowlet_v138_fix.py
+
+      - name: Verify patched V13.8 code
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq 'httpcInit(0x1000);' 3gx/sources/main.c
+          grep -Fq 'application/x-www-form-urlencoded' 3gx/sources/main.c
           grep -Fq 'rowlet_v137_notify_tick' 3gx/sources/main.c
-          grep -Fq 'rowlet_v137_net' 3gx/sources/main.c || \
-            grep -Fq 'v137_net_stage' 3gx/sources/main.c
-
           grep -Fq 'rowlet_v13_reset_sent' reader_core/src/gen7/frame.rs
           grep -Fq 'ROWLET: SHINY!' reader_core/src/gen7/frame.rs
           grep -Fq 'NET:{} ERR:{:08X}' reader_core/src/gen7/frame.rs
-          grep -Fq 'HTTP:{} TRY:{}' reader_core/src/gen7/frame.rs
-
-          echo "V13.7 source checks passed"
+          echo 'V13.8 patched source verification passed'
 
       - name: Build PokeReader plugin
         shell: bash
         run: |
           set -o pipefail
-
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            zaksabeast/devkitarm-rust make \
-            2>&1 | tee rowlet_v13_7_compile.log
+          docker run --rm -v "$PWD:/work" -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v13_8_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v13-7-network-diagnostics
+          name: rowlet-v13-8-gmail-post-buffer-fix
           path: out/default.3gx
           if-no-files-found: error
 
@@ -586,6 +139,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v13-7-compile-log
-          path: rowlet_v13_7_compile.log
+          name: rowlet-v13-8-compile-log
+          path: rowlet_v13_8_compile.log
           if-no-files-found: warn
