@@ -1,140 +1,519 @@
-# EXPERIMENTAL: not hardware tested. Back up V13.2.
-name: Build Rowlet V13.5 Gmail Counter Test
+
+name: Build Rowlet V13.5.1 Gmail Counter Verification Fix
+
 'on':
-  workflow_dispatch: null
+  workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    - name: Apply original working V13.2 patches
-      shell: bash
-      run: "set -euo pipefail\npython3 -m pip install --user PyYAML\npython3 - <<'PY'\nimport subprocess, yaml\nfrom pathlib import Path\nprevious = Path('.github/workflows/rowlet_build.yml')\n\
-        assert previous.exists(), 'Working V13.2 workflow must remain at .github/workflows/rowlet_build.yml'\ndoc = yaml.safe_load(previous.read_text())\nsteps =\
-        \ doc['jobs']['build']['steps']\ndesired = [\n    'Apply V5 decoded Rowlet watcher',\n    'Apply V6 working A-input bridge',\n    'Replace V6 test with V12.1\
-        \ A pulses and shiny-only status',\n    'Install V13.1 reset loop',\n    'V13.2 nickname keyboard START then A workaround',\n    'Fix toolchain linker compatibility',\n\
-        ]\nfor name in desired:\n    matches = [step for step in steps if step.get('name') == name]\n    if len(matches) != 1: raise SystemExit(f'Expected 1 V13.2\
-        \ step {name}, got {len(matches)}')\n    print(f'Applying {name}', flush=True)\n    subprocess.run(['bash','-e','-o','pipefail','-c',matches[0]['run']], check=True)\n\
-        PY\n"
-    - name: Add V13.3 live counter and reason codes
-      shell: bash
-      run: "cat > /tmp/v13_3.py <<'PY'\nfrom pathlib import Path\nimport re\nmain=Path('3gx/sources/main.c')\nframe=Path('reader_core/src/gen7/frame.rs')\nm=main.read_text()\n\
-        f=frame.read_text()\ndef replace_once(text, old, new, label):\n    n=text.count(old)\n    if n!=1: raise SystemExit(f'{label}: expected one exact anchor,\
-        \ got {n}; aborting')\n    return text.replace(old,new,1)\n\n# Important: this counter counts requested soft-resets within the current\n# plugin process.\
-        \ It may restart from zero when Ultra Sun reloads.\n# We deliberately avoid untested SD writes from the graphics hook.\nneedle='static u32 v13_resets = 0;'\n\
-        m=replace_once(m, needle, needle+'''\n// V13.3 stop reason codes: 0 running, 1 user B, 2 shiny, 3 error,\n// 4 input unavailable, 5 manual trigger release\
-        \ timeout,\n// 6 encounter timeout, 7 reload timeout.\nstatic volatile u32 v13_stop_reason = 0;\nu32 rowlet_v13_count(void) { return v13_resets; }\nu32 rowlet_v13_stop_reason(void)\
-        \ { return v13_stop_reason; }\nu32 rowlet_v13_mode(void) { return v13_mode; }\n''', 'counter declaration')\n\nm=replace_once(m,\n    'if (keys & KEY_B) {\
-        \ rowlet_v13_halt(); return; }',\n    'if (keys & KEY_B) { v13_stop_reason=1; rowlet_v13_halt(); return; }',\n    'B stop reason')\ndef annotate_stop(text,\
-        \ condition, reason, label):\n    # Match the precise stopping branch without depending on indentation.\n    expr = r'(if \\(' + re.escape(condition) + r'\\\
-        )\\s*\\{[^{}]*?)(rowlet_v13_halt\\(\\);)'\n    updated, n = re.subn(expr, lambda match: match.group(1) +\n                          'v13_stop_reason=' + str(reason)\
-        \ + '; ' + match.group(2),\n                          text, count=1, flags=re.S)\n    if n != 1: raise SystemExit(f'{label}: stop branch not found')\n   \
-        \ return updated\n# SHINY and ERROR are checked before reset authorization.\nm=annotate_stop(m, 'v13_phase == 5 || v13_phase == 6',\n                '(v13_phase\
-        \ == 5 ? 2u : 3u)', 'shiny/error reason')\nm=replace_once(m,\n    'if (++v13_missing_hid > 600) rowlet_v13_halt();',\n    'if (++v13_missing_hid > 600) {\
-        \ v13_stop_reason=4; rowlet_v13_halt(); }',\n    'missing HID reason')\nm=replace_once(m,\n    'if (++v13_frame > 600) rowlet_v13_halt();',\n    'if (++v13_frame\
-        \ > 600) { v13_stop_reason=5; rowlet_v13_halt(); }',\n    'trigger timeout reason')\nm=annotate_stop(m, 'v13_frame > (60u * 240u)', 6, 'encounter timeout')\n\
-        m=annotate_stop(m, '!ok && v13_reset_ok_frames < 8u', 4, 'reset input failure')\nm=annotate_stop(m, 'v13_frame > (60u * 100u)', 7, 'reload timeout')\n\n#\
-        \ Keep the V5 shiny detector and the V13.1 non-shiny-only reset gate untouched.\nold='pnp::println!(\"{}\", label);'\nnew='''pnp::println!(\"{}\", label);\n\
-        \        extern \"C\" {\n            fn rowlet_v13_count() -> u32;\n            fn rowlet_v13_stop_reason() -> u32;\n            fn rowlet_v13_mode() -> u32;\n\
-        \        }\n        let (n, stop, mode) = unsafe {\n            (rowlet_v13_count(), rowlet_v13_stop_reason(), rowlet_v13_mode())\n        };\n        pnp::println!(\"\
-        Resets this session: {}\", n);\n        if mode == 5 {\n            let why = match stop {\n                1 => \"MANUAL B\",\n                2 => \"SHINY\"\
-        ,\n                3 => \"DATA ERROR\",\n                4 => \"INPUT FAILURE\",\n                5 => \"TRIGGER TIMEOUT\",\n                6 => \"ENCOUNTER\
-        \ TIMEOUT\",\n                7 => \"RELOAD TIMEOUT\",\n                _ => \"UNKNOWN\",\n            };\n            pnp::println!(\"STOP: {}\", why);\n\
-        \        } else {\n            pnp::println!(\"AUTO: RUNNING\");\n        }\n        '''\nf=replace_once(f,old,new,'Rust status display')\nassert 'if (v13_phase\
-        \ == 4)' in m, 'Non-shiny reset gate missing'\nassert 'rowlet_try_nickname_start_frame(true)' in m, 'Working nickname logic missing'\nassert 'rowlet_v13_reset_sent'\
-        \ in f, 'Existing safety rearm missing'\nmain.write_text(m)\nframe.write_text(f)\nprint('V13.3 diagnostic display installed; reset/shiny logic unchanged.')\n\
-        PY\npython3 /tmp/v13_3.py\n"
-    - name: Add experimental Gmail sender from GitHub secrets
-      shell: bash
-      env:
-        ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
-        ROWLET_NOTIFY_TOKEN: ${{ secrets.ROWLET_NOTIFY_TOKEN }}
-      run: "set -euo pipefail\nif [ -z \"$ROWLET_NOTIFY_URL\" ] || [ -z \"$ROWLET_NOTIFY_TOKEN\" ]; then\n  echo \"Missing Actions secrets ROWLET_NOTIFY_URL and ROWLET_NOTIFY_TOKEN\"\
-        \ >&2\n  exit 1\nfi\ncat > /tmp/rowlet_gmail.py <<'PY'\nfrom pathlib import Path\nimport json, os\nmain = Path(\"3gx/sources/main.c\")\nframe = Path(\"reader_core/src/gen7/frame.rs\"\
-        )\nm, f = main.read_text(), frame.read_text()\nurl = os.environ[\"ROWLET_NOTIFY_URL\"].strip()\ntoken = os.environ[\"ROWLET_NOTIFY_TOKEN\"].strip()\nif not\
-        \ (url.startswith(\"https://script.google.com/macros/s/\") and url.endswith(\"/exec\")):\n    raise SystemExit(\"ROWLET_NOTIFY_URL must be deployed Apps Script\
-        \ /exec URL\")\nif not (20 <= len(token) <= 200 and all(33 <= ord(c) < 127 for c in token)):\n    raise SystemExit(\"ROWLET_NOTIFY_TOKEN must match Apps Script\
-        \ SECRET, min 20 ASCII chars, no spaces\")\ndef once(s, before, after, label):\n    count = s.count(before)\n    if count != 1: raise SystemExit(f\"{label}:\
-        \ expected one anchor, found {count}\")\n    return s.replace(before, after, 1)\n\nnotifier = r'''// V13.4 experimental asynchronous Gmail HTTPS sender.\n\
-        // The renderer never waits for Wi-Fi; shiny protection takes priority.\n#define ROWLET_NOTIFY_URL @@URL@@\n#define ROWLET_NOTIFY_TOKEN @@TOKEN@@\nstatic\
-        \ volatile u32 rowlet_mail_pending = 0;\nstatic volatile u32 rowlet_mail_sending = 0;\nstatic volatile u32 rowlet_mail_sent = 0;\nstatic volatile u32 rowlet_mail_frames\
-        \ = 3600;\nstatic volatile u32 rowlet_mail_tries = 0;\nu32 rowlet_notify_status(void)\n{\n    if (rowlet_mail_sent) return 3u;\n    if (rowlet_mail_sending)\
-        \ return 2u;\n    if (rowlet_mail_pending && rowlet_mail_tries) return 4u;\n    if (rowlet_mail_pending) return 1u;\n    return 0u;\n}\nstatic void rowlet_notify_worker(void\
-        \ *arg)\n{\n    (void)arg;\n    bool success = false;\n    if (R_SUCCEEDED(httpcInit(0))) {\n        httpcContext ctx;\n        Result rc = httpcOpenContext(&ctx,\
-        \ HTTPC_METHOD_POST, ROWLET_NOTIFY_URL, 1);\n        if (R_SUCCEEDED(rc)) {\n            rc = httpcAddPostDataAscii(&ctx, \"token\", ROWLET_NOTIFY_TOKEN);\n\
-        \            if (R_SUCCEEDED(rc)) {\n                rc = httpcBeginRequest(&ctx);\n                if (R_SUCCEEDED(rc)) {\n                    u32 status\
-        \ = 0;\n                    rc = httpcGetResponseStatusCode(&ctx, &status);\n                    // Google ContentService often redirects after doPost.\n\
-        \                    // 302 means request accepted, NOT verified inbox delivery.\n                    if (R_SUCCEEDED(rc) && (status == 200 || status == 302\
-        \ || status == 303))\n                        success = true;\n                }\n            }\n            httpcCloseContext(&ctx);\n        }\n       \
-        \ httpcExit();\n    }\n    if (success) rowlet_mail_sent = 1;\n    rowlet_mail_sending = 0;\n}\nstatic void rowlet_notify_tick(void)\n{\n    if (v13_phase\
-        \ == 5u) rowlet_mail_pending = 1;\n    if (!rowlet_mail_pending || rowlet_mail_sent || rowlet_mail_sending) return;\n    if (rowlet_mail_frames < 3600u) {\
-        \ ++rowlet_mail_frames; return; }\n    rowlet_mail_frames = 0;\n    rowlet_mail_sending = 1;\n    ++rowlet_mail_tries;\n    Thread t = threadCreate(rowlet_notify_worker,\
-        \ NULL, 0x8000, 0x30, -2, true);\n    if (!t) rowlet_mail_sending = 0;\n}\n'''\nnotifier = notifier.replace(\"@@URL@@\", json.dumps(url)).replace(\"@@TOKEN@@\"\
-        , json.dumps(token))\nm = once(m, 'static void rowlet_v13_tick(void)', notifier + 'static void rowlet_v13_tick(void)', 'C mail worker')\nm = once(m, 'const\
-        \ u32 trigger = KEY_L | KEY_R | KEY_Y; // X is NEVER injected',\n         'const u32 trigger = KEY_L | KEY_R | KEY_Y; // X is NEVER injected\\n          \
-        \    rowlet_notify_tick();',\n         'mail trigger')\nneedle = 'pnp::println!(\"Resets this session: {}\", n);'\naddition = \"\"\"pnp::println!(\"Resets\
-        \ this session: {}\", n);\n                  extern \"C\" { fn rowlet_notify_status() -> u32; }\n                  let mail_status = unsafe { rowlet_notify_status()\
-        \ };\n                  let mail_label = match mail_status {\n                      0 => \"MAIL: WAITING\",\n                      1 => \"MAIL: PENDING\"\
-        ,\n                      2 => \"MAIL: SENDING\",\n                      3 => \"MAIL: REQUEST SENT\",\n                      _ => \"MAIL: RETRYING / WIFI OFF\"\
-        ,\n                  };\n                  pnp::println!(\"{}\", mail_label);\"\"\"\nf = once(f, needle, addition, 'mail overlay')\nassert 'if (v13_phase\
-        \ == 4)' in m\nassert 'if (v13_phase == 5 || v13_phase == 6)' in m\nmain.write_text(m)\nframe.write_text(f)\nprint(\"V13.4 sender injected; credentials not\
-        \ logged\")\nPY\npython3 /tmp/rowlet_gmail.py\n"
-    - name: V13.5 compact overlay and test email shortcut
-      shell: bash
-      run: "set -euo pipefail\ncat > /tmp/rowlet135_patch.py <<'PY'\nfrom pathlib import Path\nm_path=Path('3gx/sources/main.c')\nf_path=Path('reader_core/src/gen7/frame.rs')\n\
-        m=m_path.read_text(); f=f_path.read_text()\ndef once(t,a,b,label):\n n=t.count(a)\n if n!=1:raise SystemExit(f'{label}: expected one anchor, found {n}')\n\
-        \ return t.replace(a,b,1)\nstart='        pnp::println!(\"Resets this session: {}\", n);'\nend='''        } else {\n            pnp::println!(\"AUTO: RUNNING\"\
-        );\n        }\n'''\nif f.count(start)!=1 or f.count(end)!=1:raise SystemExit('Display anchors changed')\na=f.index(start);b=f.index(end,a)+len(end)\nreplacement='''\
-        \        extern \"C\" { fn rowlet_notify_status() -> u32; }\n        let mail = unsafe { rowlet_notify_status() };\n        if mode == 5 {\n            let\
-        \ why = match stop {\n                1 => \"B\", 2 => \"SHINY\", 3 => \"DATA\", 4 => \"INPUT\",\n                5 => \"TRIGGER\", 6 => \"ENCOUNTER\", 7\
-        \ => \"RELOAD\", _ => \"UNKNOWN\",\n            };\n            pnp::println!(\"STOP:{} R:{} M:{}\", why, n, mail);\n        } else {\n            pnp::println!(\"\
-        R:{} MAIL:{}\", n, mail);\n        }\n'''\nf=f[:a]+replacement+f[b:]\nm=once(m,'static volatile u32 rowlet_mail_tries = 0;',\n       'static volatile u32\
-        \ rowlet_mail_tries = 0;\\nstatic u32 rowlet_mail_test_held = 0;', 'test variable')\nm=once(m, 'if (v13_phase == 5u) rowlet_mail_pending = 1;',\n'''if (v13_phase\
-        \ == 5u) rowlet_mail_pending = 1;\n    // Physical SELECT + Y manually tests email without changing Rowlet's status.\n    u32 physical = get_current_keys();\n\
-        \    u32 test_down = ((physical & (KEY_SELECT | KEY_Y)) == (KEY_SELECT | KEY_Y));\n    if (test_down && !rowlet_mail_test_held && !rowlet_mail_sent) {\n \
-        \       rowlet_mail_pending = 1;\n        rowlet_mail_frames = 3600u;\n    }\n    rowlet_mail_test_held = test_down;''', 'manual test trigger')\nassert 'if\
-        \ (v13_phase == 4)' in m\nassert 'if (v13_phase == 5 || v13_phase == 6)' in m\nm_path.write_text(m); f_path.write_text(f)\nprint('V13.5 compact UI and manual\
-        \ test installed')\nPY\npython3 /tmp/rowlet135_patch.py\n"
-    - name: Verify V13.5
-      shell: bash
-      run: 'grep -Fq ''rowlet_v13_count'' 3gx/sources/main.c
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-        grep -Fq ''Resets this session:'' reader_core/src/gen7/frame.rs
+      - name: Apply original working V13.2 patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user PyYAML
+          python3 - <<'PY'
+          import subprocess, yaml
+          from pathlib import Path
 
-        grep -Fq ''STOP: {}'' reader_core/src/gen7/frame.rs
+          previous = Path('.github/workflows/rowlet_build.yml')
+          assert previous.exists(), 'Keep the working V13.2 workflow'
 
-        grep -Fq ''if (v13_phase == 4)'' 3gx/sources/main.c
+          doc = yaml.safe_load(previous.read_text())
+          steps = doc['jobs']['build']['steps']
+          desired = [
+              'Apply V5 decoded Rowlet watcher',
+              'Apply V6 working A-input bridge',
+              'Replace V6 test with V12.1 A pulses and shiny-only status',
+              'Install V13.1 reset loop',
+              'V13.2 nickname keyboard START then A workaround',
+              'Fix toolchain linker compatibility',
+          ]
 
-        grep -Fq ''if (v13_phase == 5 || v13_phase == 6)'' 3gx/sources/main.c
+          for name in desired:
+              matches = [s for s in steps if s.get('name') == name]
+              if len(matches) != 1:
+                  raise SystemExit(f'Missing original step: {name}')
+              print(f'Applying {name}', flush=True)
+              subprocess.run(
+                  ['bash', '-e', '-o', 'pipefail', '-c', matches[0]['run']],
+                  check=True
+              )
+          PY
 
+      - name: Add reset counter and stop reasons
+        shell: bash
+        run: |
+          cat > /tmp/v13_3.py <<'PY'
+          from pathlib import Path
+          import re
 
-        grep -Fq ''rowlet_notify_tick();'' 3gx/sources/main.c
+          main = Path('3gx/sources/main.c')
+          frame = Path('reader_core/src/gen7/frame.rs')
+          m = main.read_text()
+          f = frame.read_text()
 
-        grep -Fq ''MAIL: REQUEST SENT'' reader_core/src/gen7/frame.rs
+          def replace_once(text, old, new, label):
+              n = text.count(old)
+              if n != 1:
+                  raise SystemExit(f'{label}: expected one anchor, got {n}')
+              return text.replace(old, new, 1)
 
+          needle = 'static u32 v13_resets = 0;'
+          m = replace_once(m, needle, needle + '''
+          // Stop reasons: 0 running, 1 B, 2 shiny, 3 error,
+          // 4 input failure, 5 trigger timeout,
+          // 6 encounter timeout, 7 reload timeout.
+          static volatile u32 v13_stop_reason = 0;
 
-        grep -Fq ''rowlet_mail_test_held'' 3gx/sources/main.c
+          u32 rowlet_v13_count(void) { return v13_resets; }
+          u32 rowlet_v13_stop_reason(void) { return v13_stop_reason; }
+          u32 rowlet_v13_mode(void) { return v13_mode; }
+          ''', 'counter declaration')
 
-        grep -Fq ''STOP:{} R:{} M:{}'' reader_core/src/gen7/frame.rs
+          m = replace_once(
+              m,
+              'if (keys & KEY_B) { rowlet_v13_halt(); return; }',
+              'if (keys & KEY_B) { v13_stop_reason=1; rowlet_v13_halt(); return; }',
+              'B stop reason'
+          )
 
-        '
-    - name: Build PokeReader plugin
-      shell: bash
-      run: "set -o pipefail\ndocker run --rm -v \"$PWD:/work\" -w /work \\\n  zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v13_4_compile.log\n"
-    - name: Upload 3GX
-      if: success()
-      uses: actions/upload-artifact@v4
-      with:
-        name: rowlet-v13-5-gmail-counter
-        path: out/default.3gx
-        if-no-files-found: error
-    - name: Upload compile log
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: rowlet-v13-5-compile-log
-        path: rowlet_v13_5_compile.log
-        if-no-files-found: warn
+          def annotate_stop(text, condition, reason, label):
+              expr = r'(if \(' + re.escape(condition) + r'\)\s*\{[^{}]*?)(rowlet_v13_halt\(\);)'
+              updated, n = re.subn(
+                  expr,
+                  lambda match: match.group(1) +
+                  'v13_stop_reason=' + str(reason) + '; ' + match.group(2),
+                  text,
+                  count=1,
+                  flags=re.S
+              )
+              if n != 1:
+                  raise SystemExit(f'{label}: branch not found')
+              return updated
+
+          m = annotate_stop(
+              m, 'v13_phase == 5 || v13_phase == 6',
+              '(v13_phase == 5 ? 2u : 3u)', 'shiny/error'
+          )
+
+          m = replace_once(
+              m,
+              'if (++v13_missing_hid > 600) rowlet_v13_halt();',
+              'if (++v13_missing_hid > 600) { v13_stop_reason=4; rowlet_v13_halt(); }',
+              'input failure'
+          )
+
+          m = replace_once(
+              m,
+              'if (++v13_frame > 600) rowlet_v13_halt();',
+              'if (++v13_frame > 600) { v13_stop_reason=5; rowlet_v13_halt(); }',
+              'trigger timeout'
+          )
+
+          m = annotate_stop(
+              m, 'v13_frame > (60u * 240u)',
+              6, 'encounter timeout'
+          )
+
+          m = annotate_stop(
+              m, '!ok && v13_reset_ok_frames < 8u',
+              4, 'reset input failure'
+          )
+
+          m = annotate_stop(
+              m, 'v13_frame > (60u * 100u)',
+              7, 'reload timeout'
+          )
+
+          old = 'pnp::println!("{}", label);'
+          new = '''pnp::println!("{}", label);
+                  extern "C" {
+                      fn rowlet_v13_count() -> u32;
+                      fn rowlet_v13_stop_reason() -> u32;
+                      fn rowlet_v13_mode() -> u32;
+                  }
+                  let (n, stop, mode) = unsafe {
+                      (
+                          rowlet_v13_count(),
+                          rowlet_v13_stop_reason(),
+                          rowlet_v13_mode()
+                      )
+                  };
+                  pnp::println!("Resets this session: {}", n);
+                  if mode == 5 {
+                      let why = match stop {
+                          1 => "MANUAL B",
+                          2 => "SHINY",
+                          3 => "DATA ERROR",
+                          4 => "INPUT FAILURE",
+                          5 => "TRIGGER TIMEOUT",
+                          6 => "ENCOUNTER TIMEOUT",
+                          7 => "RELOAD TIMEOUT",
+                          _ => "UNKNOWN",
+                      };
+                      pnp::println!("STOP: {}", why);
+                  } else {
+                      pnp::println!("AUTO: RUNNING");
+                  }
+                  '''
+
+          f = replace_once(f, old, new, 'Rust status display')
+
+          assert 'if (v13_phase == 4)' in m
+          assert 'rowlet_try_nickname_start_frame(true)' in m
+          assert 'rowlet_v13_reset_sent' in f
+
+          main.write_text(m)
+          frame.write_text(f)
+          print('Counter and stop reasons installed')
+          PY
+          python3 /tmp/v13_3.py
+
+      - name: Add experimental Gmail sender
+        shell: bash
+        env:
+          ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
+          ROWLET_NOTIFY_TOKEN: ${{ secrets.ROWLET_NOTIFY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$ROWLET_NOTIFY_URL" ] || [ -z "$ROWLET_NOTIFY_TOKEN" ]; then
+            echo "Missing Gmail GitHub Actions secrets"
+            exit 1
+          fi
+
+          cat > /tmp/rowlet_gmail.py <<'PY'
+          from pathlib import Path
+          import json
+          import os
+
+          main = Path('3gx/sources/main.c')
+          frame = Path('reader_core/src/gen7/frame.rs')
+
+          m = main.read_text()
+          f = frame.read_text()
+
+          url = os.environ['ROWLET_NOTIFY_URL'].strip()
+          token = os.environ['ROWLET_NOTIFY_TOKEN'].strip()
+
+          if not (
+              url.startswith('https://script.google.com/macros/s/')
+              and url.endswith('/exec')
+          ):
+              raise SystemExit('Invalid Apps Script URL')
+
+          if not (
+              20 <= len(token) <= 200
+              and all(33 <= ord(c) < 127 for c in token)
+          ):
+              raise SystemExit('Invalid notification token')
+
+          def once(s, before, after, label):
+              n = s.count(before)
+              if n != 1:
+                  raise SystemExit(f'{label}: expected one anchor, found {n}')
+              return s.replace(before, after, 1)
+
+          notifier = r'''
+          // Experimental Gmail sender.
+          #define ROWLET_NOTIFY_URL @@URL@@
+          #define ROWLET_NOTIFY_TOKEN @@TOKEN@@
+
+          static volatile u32 rowlet_mail_pending = 0;
+          static volatile u32 rowlet_mail_sending = 0;
+          static volatile u32 rowlet_mail_sent = 0;
+          static volatile u32 rowlet_mail_frames = 3600;
+          static volatile u32 rowlet_mail_tries = 0;
+
+          u32 rowlet_notify_status(void)
+          {
+              if (rowlet_mail_sent) return 3u;
+              if (rowlet_mail_sending) return 2u;
+              if (rowlet_mail_pending && rowlet_mail_tries) return 4u;
+              if (rowlet_mail_pending) return 1u;
+              return 0u;
+          }
+
+          static void rowlet_notify_worker(void *arg)
+          {
+              (void)arg;
+              bool success = false;
+
+              if (R_SUCCEEDED(httpcInit(0))) {
+                  httpcContext ctx;
+                  Result rc = httpcOpenContext(
+                      &ctx,
+                      HTTPC_METHOD_POST,
+                      ROWLET_NOTIFY_URL,
+                      1
+                  );
+
+                  if (R_SUCCEEDED(rc)) {
+                      rc = httpcAddPostDataAscii(
+                          &ctx,
+                          "token",
+                          ROWLET_NOTIFY_TOKEN
+                      );
+
+                      if (R_SUCCEEDED(rc)) {
+                          rc = httpcBeginRequest(&ctx);
+
+                          if (R_SUCCEEDED(rc)) {
+                              u32 status = 0;
+                              rc = httpcGetResponseStatusCode(
+                                  &ctx,
+                                  &status
+                              );
+
+                              if (
+                                  R_SUCCEEDED(rc) &&
+                                  (status == 200 ||
+                                   status == 302 ||
+                                   status == 303)
+                              ) {
+                                  success = true;
+                              }
+                          }
+                      }
+
+                      httpcCloseContext(&ctx);
+                  }
+
+                  httpcExit();
+              }
+
+              if (success) rowlet_mail_sent = 1;
+              rowlet_mail_sending = 0;
+          }
+
+          static void rowlet_notify_tick(void)
+          {
+              if (v13_phase == 5u)
+                  rowlet_mail_pending = 1;
+
+              if (!rowlet_mail_pending ||
+                  rowlet_mail_sent ||
+                  rowlet_mail_sending)
+                  return;
+
+              if (rowlet_mail_frames < 3600u) {
+                  ++rowlet_mail_frames;
+                  return;
+              }
+
+              rowlet_mail_frames = 0;
+              rowlet_mail_sending = 1;
+              ++rowlet_mail_tries;
+
+              Thread t = threadCreate(
+                  rowlet_notify_worker,
+                  NULL,
+                  0x8000,
+                  0x30,
+                  -2,
+                  true
+              );
+
+              if (!t)
+                  rowlet_mail_sending = 0;
+          }
+          '''
+
+          notifier = notifier.replace(
+              '@@URL@@', json.dumps(url)
+          ).replace(
+              '@@TOKEN@@', json.dumps(token)
+          )
+
+          m = once(
+              m,
+              'static void rowlet_v13_tick(void)',
+              notifier + 'static void rowlet_v13_tick(void)',
+              'Gmail worker'
+          )
+
+          m = once(
+              m,
+              'const u32 trigger = KEY_L | KEY_R | KEY_Y; // X is NEVER injected',
+              'const u32 trigger = KEY_L | KEY_R | KEY_Y; // X is NEVER injected\n              rowlet_notify_tick();',
+              'Gmail trigger'
+          )
+
+          needle = 'pnp::println!("Resets this session: {}", n);'
+
+          addition = '''pnp::println!("Resets this session: {}", n);
+                          extern "C" { fn rowlet_notify_status() -> u32; }
+                          let mail_status = unsafe {
+                              rowlet_notify_status()
+                          };
+                          let mail_label = match mail_status {
+                              0 => "MAIL: WAITING",
+                              1 => "MAIL: PENDING",
+                              2 => "MAIL: SENDING",
+                              3 => "MAIL: REQUEST SENT",
+                              _ => "MAIL: RETRYING / WIFI OFF",
+                          };
+                          pnp::println!("{}", mail_label);'''
+
+          f = once(f, needle, addition, 'Gmail display')
+
+          assert 'if (v13_phase == 4)' in m
+          assert 'if (v13_phase == 5 || v13_phase == 6)' in m
+
+          main.write_text(m)
+          frame.write_text(f)
+
+          print('Gmail sender installed')
+          PY
+
+          python3 /tmp/rowlet_gmail.py
+
+      - name: Add compact overlay and manual Gmail test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/rowlet135_patch.py <<'PY'
+          from pathlib import Path
+
+          m_path = Path('3gx/sources/main.c')
+          f_path = Path('reader_core/src/gen7/frame.rs')
+
+          m = m_path.read_text()
+          f = f_path.read_text()
+
+          def once(t, a, b, label):
+              n = t.count(a)
+              if n != 1:
+                  raise SystemExit(
+                      f'{label}: expected one anchor, found {n}'
+                  )
+              return t.replace(a, b, 1)
+
+          start = '        pnp::println!("Resets this session: {}", n);'
+
+          end = '''        } else {
+                      pnp::println!("AUTO: RUNNING");
+                  }
+          '''
+
+          if f.count(start) != 1 or f.count(end) != 1:
+              raise SystemExit('Display anchors changed')
+
+          a = f.index(start)
+          b = f.index(end, a) + len(end)
+
+          replacement = '''        extern "C" {
+                      fn rowlet_notify_status() -> u32;
+                  }
+                  let mail = unsafe { rowlet_notify_status() };
+
+                  if mode == 5 {
+                      let why = match stop {
+                          1 => "B",
+                          2 => "SHINY",
+                          3 => "DATA",
+                          4 => "INPUT",
+                          5 => "TRIGGER",
+                          6 => "ENCOUNTER",
+                          7 => "RELOAD",
+                          _ => "UNKNOWN",
+                      };
+                      pnp::println!(
+                          "STOP:{} R:{} M:{}", why, n, mail
+                      );
+                  } else {
+                      pnp::println!("R:{} MAIL:{}", n, mail);
+                  }
+          '''
+
+          f = f[:a] + replacement + f[b:]
+
+          m = once(
+              m,
+              'static volatile u32 rowlet_mail_tries = 0;',
+              'static volatile u32 rowlet_mail_tries = 0;\nstatic u32 rowlet_mail_test_held = 0;',
+              'manual test variable'
+          )
+
+          m = once(
+              m,
+              'if (v13_phase == 5u) rowlet_mail_pending = 1;',
+              '''if (v13_phase == 5u) rowlet_mail_pending = 1;
+
+              // Physical SELECT + Y tests Gmail.
+              u32 physical = get_current_keys();
+              u32 test_down = (
+                  (physical & (KEY_SELECT | KEY_Y)) ==
+                  (KEY_SELECT | KEY_Y)
+              );
+
+              if (test_down &&
+                  !rowlet_mail_test_held &&
+                  !rowlet_mail_sent) {
+                  rowlet_mail_pending = 1;
+                  rowlet_mail_frames = 3600u;
+              }
+
+              rowlet_mail_test_held = test_down;''',
+              'test email shortcut'
+          )
+
+          assert 'if (v13_phase == 4)' in m
+          assert 'if (v13_phase == 5 || v13_phase == 6)' in m
+
+          m_path.write_text(m)
+          f_path.write_text(f)
+
+          print('V13.5 display and email shortcut installed')
+          PY
+
+          python3 /tmp/rowlet135_patch.py
+
+      - name: Verify V13.5.1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq 'rowlet_v13_count' 3gx/sources/main.c
+          grep -Fq 'STOP:{} R:{} M:{}' reader_core/src/gen7/frame.rs
+          grep -Fq 'R:{} MAIL:{}' reader_core/src/gen7/frame.rs
+          grep -Fq 'if (v13_phase == 4)' 3gx/sources/main.c
+          grep -Fq 'if (v13_phase == 5 || v13_phase == 6)' 3gx/sources/main.c
+          grep -Fq 'rowlet_notify_tick();' 3gx/sources/main.c
+          grep -Fq 'rowlet_mail_test_held' 3gx/sources/main.c
+
+      - name: Build PokeReader plugin
+        shell: bash
+        run: |
+          set -o pipefail
+
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            zaksabeast/devkitarm-rust make \
+            2>&1 | tee rowlet_v13_5_compile.log
+
+      - name: Upload 3GX
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v13-5-1-gmail-counter
+          path: out/default.3gx
+          if-no-files-found: error
+
+      - name: Upload compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v13-5-1-compile-log
+          path: rowlet_v13_5_compile.log
+          if-no-files-found: warn
