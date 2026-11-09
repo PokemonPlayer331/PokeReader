@@ -1,5 +1,5 @@
 
-name: Build Rowlet V13.9 Private Memory Gmail Fix
+name: Build Rowlet V14 Offline Gmail and Network Test
 
 'on':
   workflow_dispatch:
@@ -10,115 +10,353 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository and workflow history
+      - name: Checkout repository and history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Rebuild V13.8.1 hunting and Gmail source
+      - name: Restore V13.9 hunter and network code
         shell: bash
         env:
           ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
           ROWLET_NOTIFY_TOKEN: ${{ secrets.ROWLET_NOTIFY_TOKEN }}
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import os
           import subprocess
           import yaml
 
-          if not os.environ.get('ROWLET_NOTIFY_URL') or not os.environ.get('ROWLET_NOTIFY_TOKEN'):
-              raise SystemExit('Missing notification GitHub secrets')
+          path = ".github/workflows/rowlet_v13_5_gmail_counter.yml"
 
-          filename = '.github/workflows/rowlet_v13_5_gmail_counter.yml'
+          if not os.environ.get("ROWLET_NOTIFY_URL"):
+              raise SystemExit("Missing ROWLET_NOTIFY_URL secret")
+
+          if not os.environ.get("ROWLET_NOTIFY_TOKEN"):
+              raise SystemExit("Missing ROWLET_NOTIFY_TOKEN secret")
+
           commits = subprocess.check_output(
-              ['git', 'log', '--all', '--format=%H', '--', filename], text=True
+              ["git", "log", "--all", "--format=%H", "--", path],
+              text=True
           ).splitlines()
 
           previous = None
+
           for commit in commits:
               result = subprocess.run(
-                  ['git', 'show', f'{commit}:{filename}'],
-                  capture_output=True, text=True
+                  ["git", "show", f"{commit}:{path}"],
+                  capture_output=True,
+                  text=True
               )
+
               if result.returncode:
                   continue
+
               try:
                   candidate = yaml.safe_load(result.stdout)
               except yaml.YAMLError:
                   continue
-              if isinstance(candidate, dict) and candidate.get('name') == 'Build Rowlet V13.8.1 Gmail POST Fix':
+
+              if not isinstance(candidate, dict):
+                  continue
+
+              if candidate.get("name") == (
+                  "Build Rowlet V13.9 Private Memory Gmail Fix"
+              ):
                   previous = candidate
-                  print('Restoring V13.8.1 from commit:', commit[:12])
+                  print("Found V13.9:", commit[:12])
                   break
 
           if previous is None:
-              raise SystemExit('V13.8.1 workflow not found in Git history; nothing was changed')
-
-          steps = previous['jobs']['build']['steps']
-          for name in ('Recover V13.7 from Git history', 'Fix Gmail HTTP buffer and form data'):
-              matches = [step for step in steps if step.get('name') == name]
-              if len(matches) != 1:
-                  raise SystemExit('Required V13.8.1 build step missing: ' + name)
-              print('Applying:', name, flush=True)
-              subprocess.run(
-                  ['bash', '-e', '-o', 'pipefail', '-c', matches[0]['run']],
-                  env=os.environ.copy(), check=True
+              raise SystemExit(
+                  "Could not find V13.9 in Git history"
               )
-          print('V13.8.1 hunting, counter, and Gmail diagnostics restored')
+
+          steps = previous["jobs"]["build"]["steps"]
+
+          required = [
+              "Rebuild V13.8.1 hunting and Gmail source",
+              "Enable private memory in plugin header",
+          ]
+
+          for name in required:
+              matches = [
+                  step for step in steps
+                  if step.get("name") == name
+              ]
+
+              if len(matches) != 1:
+                  raise SystemExit(
+                      "Missing source step: " + name
+                  )
+
+              print("Applying:", name, flush=True)
+
+              subprocess.run(
+                  [
+                      "bash",
+                      "-e",
+                      "-o",
+                      "pipefail",
+                      "-c",
+                      matches[0]["run"]
+                  ],
+                  env=os.environ.copy(),
+                  check=True
+              )
+
+          print("V13.9 restored")
           PY
 
-      - name: Enable private memory in plugin header
+      - name: Add offline-safe notification and internet probe
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+
+          cat > /tmp/rowlet_v14.py <<'PY'
           from pathlib import Path
 
-          p = Path('3gx/PokeReader.plgInfo')
-          if not p.is_file():
-              raise SystemExit('PokeReader.plgInfo missing')
-          s = p.read_text()
-          if 'UsePrivateMemory:' in s:
-              lines = s.splitlines()
-              matches = [i for i, x in enumerate(lines) if x.strip().startswith('UsePrivateMemory:')]
-              if len(matches) != 1:
-                  raise SystemExit('Ambiguous existing UsePrivateMemory setting')
-              lines[matches[0]] = 'UsePrivateMemory: true'
-              s = '\n'.join(lines) + '\n'
-          else:
-              s = s.rstrip('\n') + '\nUsePrivateMemory: true\n'
-          p.write_text(s)
-          print('Enabled UsePrivateMemory for .3gx plugin networking')
+          main = Path("3gx/sources/main.c")
+          frame = Path("reader_core/src/gen7/frame.rs")
+
+          m = main.read_text()
+          f = frame.read_text()
+
+          def once(source, old, new, label):
+              found = source.count(old)
+
+              if found != 1:
+                  raise SystemExit(
+                      f"{label}: expected 1 anchor, found {found}"
+                  )
+
+              return source.replace(old, new, 1)
+
+          # ------------------------------------
+          # Independent connectivity diagnostic
+          # Runs only after the hunt has stopped
+          # ------------------------------------
+
+          probe = r'''
+          // V14: Internet connectivity probe.
+          // This is only called from the stopped
+          // notification path, never during hunting.
+
+          static volatile u32 v14_probe_stage = 0;
+          static volatile u32 v14_probe_code = 0;
+          static u32 v14_probe_done = 0;
+
+          u32 rowlet_v14_probe_stage(void)
+          {
+              return v14_probe_stage;
+          }
+
+          u32 rowlet_v14_probe_code(void)
+          {
+              return v14_probe_code;
+          }
+
+          static void rowlet_v14_probe(void)
+          {
+              if (v14_probe_done)
+                  return;
+
+              v14_probe_done = 1;
+              v14_probe_code = 0;
+              v14_probe_stage = 1;
+
+              Result rc = httpcInit(0x1000);
+
+              if (R_FAILED(rc)) {
+                  v14_probe_code = (u32)rc;
+                  return;
+              }
+
+              httpcContext ctx;
+
+              v14_probe_stage = 2;
+
+              rc = httpcOpenContext(
+                  &ctx,
+                  HTTPC_METHOD_GET,
+                  "http://example.com/",
+                  1
+              );
+
+              if (R_FAILED(rc)) {
+                  v14_probe_code = (u32)rc;
+                  httpcExit();
+                  return;
+              }
+
+              v14_probe_stage = 3;
+
+              rc = httpcBeginRequest(&ctx);
+
+              if (R_FAILED(rc)) {
+                  v14_probe_code = (u32)rc;
+                  httpcCloseContext(&ctx);
+                  httpcExit();
+                  return;
+              }
+
+              v14_probe_stage = 4;
+
+              u32 status = 0;
+
+              rc = httpcGetResponseStatusCode(
+                  &ctx,
+                  &status
+              );
+
+              if (R_FAILED(rc)) {
+                  v14_probe_code = (u32)rc;
+              } else {
+                  v14_probe_stage = 5;
+                  v14_probe_code = status;
+              }
+
+              httpcCloseContext(&ctx);
+              httpcExit();
+          }
+
+          '''
+
+          m = once(
+              m,
+              "static bool rowlet_v137_send_mail(void)",
+              probe + "static bool rowlet_v137_send_mail(void)",
+              "Network probe insertion"
+          )
+
+          # ------------------------------------
+          # Wi-Fi gating and offline retries
+          # ------------------------------------
+
+          old = '''v137_mail_frames = 0u;
+              v137_mail = 2u;
+              ++v137_attempts;
+
+              bool ok = rowlet_v137_send_mail();'''
+
+          new = '''v137_mail_frames = 0u;
+
+              // No Wi-Fi signal? Keep the mail pending.
+              // Do not attempt HTTP while disconnected.
+              if (osGetWifiStrength() == 0) {
+                  v137_mail = 4u;
+                  v137_net_stage = 8u;
+                  v137_net_error = 0u;
+                  v137_http_status = 0u;
+                  return;
+              }
+
+              // The first connected test checks whether
+              // a normal HTTP website is reachable.
+              // This does not change shiny detection.
+              rowlet_v14_probe();
+
+              v137_mail = 2u;
+              ++v137_attempts;
+
+              bool ok = rowlet_v137_send_mail();'''
+
+          m = once(
+              m,
+              old,
+              new,
+              "Offline retry logic"
+          )
+
+          # ------------------------------------
+          # Show network test result on screen
+          # ------------------------------------
+
+          display_anchor = '''pnp::println!("MAIL: {}", mail_text);'''
+
+          display_new = '''pnp::println!("MAIL: {}", mail_text);
+
+                  extern "C" {
+                      fn rowlet_v14_probe_stage() -> u32;
+                      fn rowlet_v14_probe_code() -> u32;
+                  }
+
+                  let (web_stage, web_code) = unsafe {
+                      (
+                          rowlet_v14_probe_stage(),
+                          rowlet_v14_probe_code()
+                      )
+                  };
+
+                  pnp::println!(
+                      "WEB:{} CODE:{:08X}",
+                      web_stage,
+                      web_code
+                  );'''
+
+          f = once(
+              f,
+              display_anchor,
+              display_new,
+              "Connectivity display"
+          )
+
+          # Verify shiny safety remains unchanged.
+          assert "if (v13_phase == 4)" in m
+          assert "rowlet_v13_halt();" in m
+          assert "rowlet_v137_notify_tick" in m
+          assert "rowlet_v13_reset_sent" in f
+          assert "ROWLET: SHINY!" in f
+
+          main.write_text(m)
+          frame.write_text(f)
+
+          print("V14 offline support installed")
           PY
 
-      - name: Verify V13.9 safety gates and private memory
+          python3 /tmp/rowlet_v14.py
+
+      - name: Verify V14
         shell: bash
         run: |
           set -euo pipefail
-          grep -Fqx 'UsePrivateMemory: true' 3gx/PokeReader.plgInfo
-          grep -Fq 'httpcInit(0x1000)' 3gx/sources/main.c
-          grep -Fq 'application/x-www-form-urlencoded' 3gx/sources/main.c
+
+          grep -Fq 'UsePrivateMemory: true' 3gx/PokeReader.plgInfo
+
+          grep -Fq 'rowlet_v14_probe' 3gx/sources/main.c
+          grep -Fq 'osGetWifiStrength()' 3gx/sources/main.c
+
+          grep -Fq 'rowlet_v137_send_mail' 3gx/sources/main.c
           grep -Fq 'rowlet_v137_notify_tick' 3gx/sources/main.c
+
           grep -Fq 'if (v13_phase == 4)' 3gx/sources/main.c
           grep -Fq 'rowlet_v13_reset_sent' reader_core/src/gen7/frame.rs
+
           grep -Fq 'ROWLET: SHINY!' reader_core/src/gen7/frame.rs
+          grep -Fq 'WEB:{} CODE:{:08X}' reader_core/src/gen7/frame.rs
           grep -Fq 'NET:{} ERR:{:08X}' reader_core/src/gen7/frame.rs
-          echo 'V13.9 checks passed'
+
+          echo "V14 checks passed"
 
       - name: Build PokeReader plugin
         shell: bash
         run: |
           set -o pipefail
-          docker run --rm -v "$PWD:/work" -w /work \
-            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v13_9_compile.log
+
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            zaksabeast/devkitarm-rust make \
+            2>&1 | tee rowlet_v14_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v13-9-private-memory-gmail
+          name: rowlet-v14-offline-gmail
           path: out/default.3gx
           if-no-files-found: error
 
@@ -126,6 +364,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v13-9-compile-log
-          path: rowlet_v13_9_compile.log
+          name: rowlet-v14-compile-log
+          path: rowlet_v14_compile.log
           if-no-files-found: warn
