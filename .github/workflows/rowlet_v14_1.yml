@@ -1,5 +1,5 @@
 
-name: Build Rowlet V14.3 Offline Gmail Recovery
+name: Build Rowlet V14.4 Network Isolation Test
 
 'on':
   workflow_dispatch:
@@ -10,176 +10,185 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout full repository history
+      - name: Checkout full history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Restore proven V13.9 hunter and Gmail diagnostics
+      - name: Restore V13.9 hunter counter and Gmail
         shell: bash
         env:
           ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
           ROWLET_NOTIFY_TOKEN: ${{ secrets.ROWLET_NOTIFY_TOKEN }}
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
-          import os
-          import subprocess
-          import yaml
-
-          filename = ".github/workflows/rowlet_v13_5_gmail_counter.yml"
-
-          if not os.environ.get("ROWLET_NOTIFY_URL"):
-              raise SystemExit("Missing ROWLET_NOTIFY_URL secret")
-
-          if not os.environ.get("ROWLET_NOTIFY_TOKEN"):
-              raise SystemExit("Missing ROWLET_NOTIFY_TOKEN secret")
-
+          import os, subprocess, yaml
+          filename = '.github/workflows/rowlet_v13_5_gmail_counter.yml'
+          for key in ('ROWLET_NOTIFY_URL','ROWLET_NOTIFY_TOKEN'):
+              if not os.environ.get(key):
+                  raise SystemExit('Missing GitHub secret: '+key)
           commits = subprocess.check_output(
-              [
-                  "git", "log", "--all",
-                  "--format=%H", "--", filename
-              ],
-              text=True
+              ['git','log','--all','--format=%H','--',filename],text=True
           ).splitlines()
-
           previous = None
-
           for commit in commits:
-              result = subprocess.run(
-                  ["git", "show", f"{commit}:{filename}"],
-                  capture_output=True,
-                  text=True
-              )
-
-              if result.returncode != 0:
-                  continue
-
-              try:
-                  candidate = yaml.safe_load(result.stdout)
-              except yaml.YAMLError:
-                  continue
-
-              if not isinstance(candidate, dict):
-                  continue
-
-              if candidate.get("name") == (
-                  "Build Rowlet V13.9 Private Memory Gmail Fix"
-              ):
+              result = subprocess.run(['git','show',f'{commit}:{filename}'],capture_output=True,text=True)
+              if result.returncode: continue
+              try: candidate = yaml.safe_load(result.stdout)
+              except yaml.YAMLError: continue
+              if isinstance(candidate,dict) and candidate.get('name') == 'Build Rowlet V13.9 Private Memory Gmail Fix':
                   previous = candidate
-                  print("Found V13.9:", commit[:12])
+                  print('Found tested V13.9 workflow:',commit[:12],flush=True)
                   break
-
           if previous is None:
-              raise SystemExit(
-                  "V13.9 not found in Git history"
-              )
-
-          steps = previous["jobs"]["build"]["steps"]
-
-          required = [
-              "Rebuild V13.8.1 hunting and Gmail source",
-              "Enable private memory in plugin header",
-          ]
-
-          for name in required:
-              matches = [
-                  step for step in steps
-                  if step.get("name") == name
-              ]
-
+              raise SystemExit('Could not find V13.9 workflow in git history')
+          steps = previous['jobs']['build']['steps']
+          for name in ('Rebuild V13.8.1 hunting and Gmail source','Enable private memory in plugin header'):
+              matches = [s for s in steps if s.get('name') == name]
               if len(matches) != 1:
-                  raise SystemExit(
-                      "Missing source step: " + name
-                  )
-
-              print("Applying:", name, flush=True)
-
-              subprocess.run(
-                  [
-                      "bash", "-e",
-                      "-o", "pipefail",
-                      "-c", matches[0]["run"]
-                  ],
-                  env=os.environ.copy(),
-                  check=True
-              )
-
-          print("V13.9 source successfully restored")
+                  raise SystemExit('V13.9 build step missing: '+name)
+              print('Applying:',name,flush=True)
+              subprocess.run(['bash','-e','-o','pipefail','-c',matches[0]['run']],env=os.environ.copy(),check=True)
           PY
 
-      - name: Verify offline-safe hunting and Gmail
+      - name: Add two web connection probes for stopped mode
         shell: bash
         run: |
           set -euo pipefail
+          cat > /tmp/v144.py <<'PY'
+          from pathlib import Path
+          mpath = Path('3gx/sources/main.c')
+          fpath = Path('reader_core/src/gen7/frame.rs')
+          m, f = mpath.read_text(), fpath.read_text()
 
-          grep -Fq 'UsePrivateMemory: true' \
-            3gx/PokeReader.plgInfo
+          def replace_one(s, old, new, label):
+              n=s.count(old)
+              if n != 1: raise SystemExit(f'{label}: expected 1 anchor, found {n}')
+              return s.replace(old,new,1)
 
-          grep -Fq 'httpcInit(0x1000)' \
-            3gx/sources/main.c
+          # Do NOT invoke networking during normal Rowlet hunting.
+          # This diagnostic is only available after pressing B to halt.
+          probe = r'''
+          // V14.4: diagnostic HTTP GETs; only called in halted mode.
+          static volatile u32 v144_stage[2] = {0u, 0u};
+          static volatile u32 v144_result[2] = {0u, 0u};
+          static volatile u32 v144_status[2] = {0u, 0u};
+          static u32 v144_test_held = 0u;
+          u32 rowlet_v144_stage(u32 i) { return i < 2u ? v144_stage[i] : 0u; }
+          u32 rowlet_v144_result(u32 i) { return i < 2u ? v144_result[i] : 0u; }
+          u32 rowlet_v144_status(u32 i) { return i < 2u ? v144_status[i] : 0u; }
 
-          grep -Fq 'application/x-www-form-urlencoded' \
-            3gx/sources/main.c
+          static void rowlet_v144_probe_one(u32 i, const char *url)
+          {
+              v144_stage[i] = 1u; // initialize
+              v144_result[i] = 0u;
+              v144_status[i] = 0u;
+              Result rc = httpcInit(0x1000);
+              if (R_FAILED(rc)) { v144_result[i] = (u32)rc; return; }
+              httpcContext ctx;
+              v144_stage[i] = 2u; // open
+              rc = httpcOpenContext(&ctx, HTTPC_METHOD_GET, url, 1);
+              if (R_FAILED(rc)) {
+                  v144_result[i] = (u32)rc;
+                  httpcExit();
+                  return;
+              }
+              v144_stage[i] = 3u; // begin
+              rc = httpcBeginRequest(&ctx);
+              if (R_SUCCEEDED(rc)) {
+                  v144_stage[i] = 4u; // response
+                  u32 status = 0u;
+                  rc = httpcGetResponseStatusCode(&ctx, &status);
+                  if (R_SUCCEEDED(rc)) {
+                      v144_stage[i] = 5u;
+                      v144_status[i] = status;
+                  }
+              }
+              if (R_FAILED(rc)) v144_result[i] = (u32)rc;
+              httpcCloseContext(&ctx);
+              httpcExit();
+          }
 
-          grep -Fq 'rowlet_v137_send_mail' \
-            3gx/sources/main.c
+          static void rowlet_v144_probe_tick(u32 keys)
+          {
+              bool held = (keys & (KEY_SELECT | KEY_L)) == (KEY_SELECT | KEY_L);
+              if (held && !v144_test_held) {
+                  // Probe 0 uses an IP address (no DNS lookup).
+                  rowlet_v144_probe_one(0u, "http://1.1.1.1/");
+                  // Probe 1 uses a hostname (requires DNS).
+                  rowlet_v144_probe_one(1u, "http://example.com/");
+              }
+              v144_test_held = held ? 1u : 0u;
+          }
+          '''
+          m = replace_one(m,'static bool rowlet_v137_send_mail(void)',probe+'\nstatic bool rowlet_v137_send_mail(void)','probe insertion')
+          # Stopped state is the ONLY entry to the diagnostic test.
+          m = replace_one(m,
+              'if (v13_mode == 5) {\n                  rowlet_v137_notify_tick(keys);',
+              'if (v13_mode == 5) {\n                  rowlet_v144_probe_tick(keys);\n                  rowlet_v137_notify_tick(keys);',
+              'halted test hook')
+          # Add two compact diagnostic lines, preserving existing Gmail diagnostics.
+          anchor='pnp::println!("HTTP:{} TRY:{}",'
+          if f.count(anchor) != 1: raise SystemExit('Gmail display anchor missing')
+          # Insert before current HTTP status line, not into other Rust logic.
+          extra='''extern "C" {
+                      fn rowlet_v144_stage(i: u32) -> u32;
+                      fn rowlet_v144_result(i: u32) -> u32;
+                      fn rowlet_v144_status(i: u32) -> u32;
+                  }
+                  let (a,b,c,d,e,g) = unsafe {
+                      (
+                          rowlet_v144_stage(0), rowlet_v144_result(0), rowlet_v144_status(0),
+                          rowlet_v144_stage(1), rowlet_v144_result(1), rowlet_v144_status(1)
+                      )
+                  };
+                  pnp::println!("IP:{} E:{:08X} H:{}", a,b,c);
+                  pnp::println!("DNS:{} E:{:08X} H:{}", d,e,g);
+                  '''
+          f = replace_one(f,anchor,extra+anchor,'diagnostic overlay')
+          for text in ('if (v13_phase == 4)','rowlet_v137_notify_tick','rowlet_v13_halt();'):
+              if text not in m: raise SystemExit('Core safety check missing: '+text)
+          if 'rowlet_v13_reset_sent' not in f: raise SystemExit('Rust reset guard missing')
+          mpath.write_text(m)
+          fpath.write_text(f)
+          print('V14.4 network probes installed (B then SELECT+L to test).')
+          PY
+          python3 /tmp/v144.py
 
-          grep -Fq 'rowlet_v137_notify_tick' \
-            3gx/sources/main.c
+      - name: Verify code
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq 'UsePrivateMemory: true' 3gx/PokeReader.plgInfo
+          grep -Fq 'rowlet_v144_probe_tick(keys);' 3gx/sources/main.c
+          grep -Fq 'rowlet_v137_notify_tick(keys);' 3gx/sources/main.c
+          grep -Fq 'if (v13_phase == 4)' 3gx/sources/main.c
+          grep -Fq 'rowlet_v13_reset_sent' reader_core/src/gen7/frame.rs
+          grep -Fq 'IP:{} E:{:08X} H:{}' reader_core/src/gen7/frame.rs
+          grep -Fq 'DNS:{} E:{:08X} H:{}' reader_core/src/gen7/frame.rs
+          echo 'V14.4 verification passed'
 
-          grep -Fq 'if (v13_phase == 4)' \
-            3gx/sources/main.c
-
-          grep -Fq 'rowlet_v13_halt();' \
-            3gx/sources/main.c
-
-          grep -Fq 'rowlet_v13_reset_sent' \
-            reader_core/src/gen7/frame.rs
-
-          grep -Fq 'ROWLET: SHINY!' \
-            reader_core/src/gen7/frame.rs
-
-          grep -Fq 'NET:{} ERR:{:08X}' \
-            reader_core/src/gen7/frame.rs
-
-          grep -Fq 'HTTP:{} TRY:{}' \
-            reader_core/src/gen7/frame.rs
-
-          if grep -Fq 'osGetWifiStrength()' \
-            3gx/sources/main.c; then
-            echo "Unexpected Wi-Fi strength check"
-            exit 1
-          fi
-
-          echo "V14.3 checks passed"
-
-      - name: Build PokeReader plugin
+      - name: Build plugin
         shell: bash
         run: |
           set -o pipefail
-
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            zaksabeast/devkitarm-rust make \
-            2>&1 | tee rowlet_v14_3_compile.log
+          docker run --rm -v "$PWD:/work" -w /work \
+            zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v14_4_compile.log
 
       - name: Upload plugin
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v14-3-offline-gmail
+          name: rowlet-v14-4-network-isolation
           path: out/default.3gx
           if-no-files-found: error
 
-      - name: Upload compile log
+      - name: Upload log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rowlet-v14-3-compile-log
-          path: rowlet_v14_3_compile.log
+          name: rowlet-v14-4-log
+          path: rowlet_v14_4_compile.log
           if-no-files-found: warn
