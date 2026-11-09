@@ -1,0 +1,255 @@
+name: Build Rowlet V14.1 WiFi Retry Fix
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore V14 hunter and notification code
+        shell: bash
+        env:
+          ROWLET_NOTIFY_URL: ${{ secrets.ROWLET_NOTIFY_URL }}
+          ROWLET_NOTIFY_TOKEN: ${{ secrets.ROWLET_NOTIFY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import yaml
+
+          filename = ".github/workflows/rowlet_v13_5_gmail_counter.yml"
+
+          if not os.environ.get("ROWLET_NOTIFY_URL"):
+              raise SystemExit("Missing ROWLET_NOTIFY_URL secret")
+
+          if not os.environ.get("ROWLET_NOTIFY_TOKEN"):
+              raise SystemExit("Missing ROWLET_NOTIFY_TOKEN secret")
+
+          commits = subprocess.check_output(
+              [
+                  "git", "log", "--all",
+                  "--format=%H", "--", filename
+              ],
+              text=True
+          ).splitlines()
+
+          previous = None
+
+          for commit in commits:
+              result = subprocess.run(
+                  ["git", "show", f"{commit}:{filename}"],
+                  capture_output=True,
+                  text=True
+              )
+
+              if result.returncode != 0:
+                  continue
+
+              try:
+                  candidate = yaml.safe_load(result.stdout)
+              except yaml.YAMLError:
+                  continue
+
+              if (
+                  isinstance(candidate, dict)
+                  and candidate.get("name") ==
+                  "Build Rowlet V14 Offline Gmail and Network Test"
+              ):
+                  previous = candidate
+                  print("Found V14 commit:", commit[:12])
+                  break
+
+          if previous is None:
+              raise SystemExit(
+                  "Cannot find V14 workflow in Git history"
+              )
+
+          steps = previous["jobs"]["build"]["steps"]
+
+          required = [
+              "Restore V13.9 hunter and network code",
+              "Add offline-safe notification and internet probe",
+          ]
+
+          for name in required:
+              matches = [
+                  step for step in steps
+                  if step.get("name") == name
+              ]
+
+              if len(matches) != 1:
+                  raise SystemExit(
+                      "Missing V14 step: " + name
+                  )
+
+              print("Applying:", name, flush=True)
+
+              subprocess.run(
+                  [
+                      "bash",
+                      "-e",
+                      "-o",
+                      "pipefail",
+                      "-c",
+                      matches[0]["run"]
+                  ],
+                  env=os.environ.copy(),
+                  check=True
+              )
+
+          print("V14 source successfully restored")
+          PY
+
+      - name: Fix offline Gmail retries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("3gx/sources/main.c")
+          source = path.read_text()
+
+          # V14 incorrectly assumed that a zero WiFi
+          # strength reading meant no internet was
+          # available. This prevented all HTTP attempts.
+
+          old = '''              // No Wi-Fi signal? Keep the mail pending.
+              // Do not attempt HTTP while disconnected.
+              if (osGetWifiStrength() == 0) {
+                  v137_mail = 4u;
+                  v137_net_stage = 8u;
+                  v137_net_error = 0u;
+                  v137_http_status = 0u;
+                  return;
+              }
+
+              // The first connected test checks whether
+              // a normal HTTP website is reachable.
+              // This does not change shiny detection.
+              rowlet_v14_probe();
+
+'''
+
+          new = '''              // V14.1:
+              // Always attempt delivery when due.
+              // Failed requests remain pending.
+              // Never require WiFi for shiny hunting.
+
+'''
+
+          if source.count(old) != 1:
+              raise SystemExit(
+                  "V14 WiFi gate not found. "
+                  "No source changes written."
+              )
+
+          source = source.replace(old, new, 1)
+
+          # The V13.7 HTTP error diagnostics remain
+          # in place so we can identify failures.
+
+          required = [
+              "rowlet_v137_send_mail",
+              "rowlet_v137_notify_tick",
+              "if (v13_phase == 4)",
+              "rowlet_v13_halt();",
+              "httpcInit(0x1000)",
+          ]
+
+          for item in required:
+              if item not in source:
+                  raise SystemExit(
+                      "Required source missing: " + item
+                  )
+
+          if "if (osGetWifiStrength() == 0)" in source:
+              raise SystemExit(
+                  "Old WiFi gate is still present"
+              )
+
+          path.write_text(source)
+
+          print("V14.1 offline retry fix installed")
+          PY
+
+      - name: Verify Rowlet V14.1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Fq 'UsePrivateMemory: true' \
+            3gx/PokeReader.plgInfo
+
+          grep -Fq 'httpcInit(0x1000)' \
+            3gx/sources/main.c
+
+          grep -Fq 'rowlet_v137_send_mail' \
+            3gx/sources/main.c
+
+          grep -Fq 'rowlet_v137_notify_tick' \
+            3gx/sources/main.c
+
+          grep -Fq 'if (v13_phase == 4)' \
+            3gx/sources/main.c
+
+          grep -Fq 'rowlet_v13_reset_sent' \
+            reader_core/src/gen7/frame.rs
+
+          grep -Fq 'ROWLET: SHINY!' \
+            reader_core/src/gen7/frame.rs
+
+          grep -Fq 'NET:{} ERR:{:08X}' \
+            reader_core/src/gen7/frame.rs
+
+          grep -Fq 'HTTP:{} TRY:{}' \
+            reader_core/src/gen7/frame.rs
+
+          if grep -Fq \
+            'if (osGetWifiStrength() == 0)' \
+            3gx/sources/main.c; then
+            echo "Old WiFi gate still present"
+            exit 1
+          fi
+
+          echo "V14.1 source checks passed"
+
+      - name: Build PokeReader plugin
+        shell: bash
+        run: |
+          set -o pipefail
+
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            zaksabeast/devkitarm-rust make \
+            2>&1 | tee rowlet_v14_1_compile.log
+
+      - name: Upload plugin
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v14-1-wifi-retry-fix
+          path: out/default.3gx
+          if-no-files-found: error
+
+      - name: Upload compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rowlet-v14-1-compile-log
+          path: rowlet_v14_1_compile.log
+          if-no-files-found: warn
