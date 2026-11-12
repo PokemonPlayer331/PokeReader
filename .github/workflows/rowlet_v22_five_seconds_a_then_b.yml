@@ -1,0 +1,270 @@
+# Experiment based on V13.4 stable build. The patch to romfs/a/0/9/2 stays untouched.
+# 0.5s initial auto-start grace, A for 5s after WaitRowlet begins, B for 15s.
+# The original START->A recovery remains after the B-only window expires.
+# Not a nickname-screen detector; watch the first resets and keep your original 3GX.
+name: Rowlet V22 - 5 Seconds A Then B
+'on':
+  workflow_dispatch:
+    inputs:
+      startup_a_delay_frames:
+        description: 'Cold-start delay before A-mashing (30 = 0.5 sec; old was 240 = 4 sec)'
+        required: false
+        type: string
+        default: '30'
+      opening_a_frames:
+        description: 'A-mash after Rowlet-wait phase begins (300=5 seconds)'
+        required: false
+        type: string
+        default: '300'
+      nickname_b_frames:
+        description: B-only window; no A pressed (900=15s)
+        required: false
+        type: string
+        default: '900'
+  push:
+    paths:
+    - .github/workflows/rowlet_v22_five_seconds_a_then_b.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+    - name: Restore existing proven V13.4 SD-counter build
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        from pathlib import Path
+        import subprocess
+        import yaml
+        path = Path('.github/workflows/rowlet_v14_1.yml')
+        workflow = yaml.safe_load(path.read_text())
+        steps = workflow['jobs']['build']['steps']
+        for name in (
+            'Restore original working V13.2',
+            'Install SD counter with verified reset hook',
+            'Verify counter and shiny safety',
+        ):
+            matches = [s for s in steps if s.get('name') == name]
+            if len(matches) != 1:
+                raise SystemExit('Expected original build step once: ' + name)
+            print('Applying original stable step: ', name, flush=True)
+            subprocess.run(['bash','-e','-o','pipefail','-c',matches[0]['run']], check=True)
+        PY
+    - name: Install nickname B window (based on proven V19)
+      env:
+        A_FRAMES: ${{ inputs.opening_a_frames || '300' }}
+        B_FRAMES: ${{ inputs.nickname_b_frames || '900' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        from pathlib import Path
+        import os,re
+
+        main=Path('3gx/sources/main.c')
+        hid=Path('3gx/sources/hid.c')
+        head=Path('3gx/includes/hid.h')
+        m,h,d=main.read_text(),hid.read_text(),head.read_text()
+
+        def replace_once(s,old,new,label):
+            if s.count(old)!=1:raise SystemExit('%s: expected one match, got %s'%(label,s.count(old)))
+            return s.replace(old,new,1)
+
+        opening=int(os.environ.get('A_FRAMES','300'))
+        window=int(os.environ.get('B_FRAMES','900'))
+        if not 30 <= opening <= 360:raise SystemExit('opening_a_frames must be from 30 to 360')
+        if not 120 <= window <= 1800:raise SystemExit('nickname_b_frames must be from 120 to 1800')
+
+        # Keep the proven V13.4 C source intact: change the A-pulse name only,
+        # insert a wrapper. This avoids deleting the SD persistence helpers which
+        # V17 lost and avoids touching the state machine or Rust shiny detection.
+        pulse='static void rowlet_v13_a_pulse(void)'
+        tick='static void rowlet_v13_tick(void)'
+        if m.count(pulse)!=1 or m.count(tick)!=1:
+            raise SystemExit('Expected one V13.4 hunter tick and one A-pulse definition')
+        start=m.index(pulse)
+        stop=m.index(tick,start)
+        sd_marker='static void rowlet_sd_load(void)'
+        if sd_marker not in m[start:stop]:
+            raise SystemExit('No V13.4 SD helpers; refusing to modify hunter')
+        if 'rowlet_try_nickname_start_frame(true)' not in m[start:stop]:
+            raise SystemExit('Original START->A keyboard fallback missing')
+        m=replace_once(m,pulse,'static void rowlet_v22_original_a_pulse(void)','rename original pulse')
+
+        # B becomes an injected key, so change the MANUAL stop to L+R+B.
+        m=replace_once(m,
+            'if (keys & KEY_B) { rowlet_v13_halt(); return; }',
+            'if ((keys & (KEY_L | KEY_R | KEY_B)) == (KEY_L | KEY_R | KEY_B)) { rowlet_v13_halt(); return; }',
+            'manual emergency stop')
+
+        # Before the original V13.4 state-machine tick; SD helpers remain in place.
+        wrapper=r'''
+        // V22: A for 300 frames after Rowlet-wait begins, then B-only for 900 frames.
+        // This is a TIMED experiment, not a verified prompt detector.
+        // Normal title/reload/reset behavior and the original START->A fallback remain.
+        static u32 rowlet_v22_phase1_ticks = 0;
+        static bool rowlet_v22_in_phase1 = false;
+        static void rowlet_v13_a_pulse(void)
+        {
+            if (v13_mode != 2 || v13_phase != 1) {
+                rowlet_v22_in_phase1 = false;
+                rowlet_try_nickname_b_frame(false);
+                rowlet_v22_original_a_pulse();
+                return;
+            }
+            if (!rowlet_v22_in_phase1) {
+                rowlet_v22_phase1_ticks = 0;
+                rowlet_v22_in_phase1 = true;
+            }
+            const u32 opening = __OPEN__u;
+            const u32 end = opening + __WINDOW__u;
+            const u32 t = rowlet_v22_phase1_ticks++;
+            if (t < opening || t >= end) {
+                // Original A pulses for the opening; only used again as an
+                // emergency recovery after the B-only window expires.
+                rowlet_try_nickname_b_frame(false);
+                rowlet_v22_original_a_pulse();
+                return;
+            }
+            // This whole window has NO A input: B selects No at the prompt.
+            // 3 frames held + 9 frames released, repeated at 60 fps.
+            const u32 bstep = (t - opening) % 12u;
+            bool ok = rowlet_try_nickname_start_frame(false);
+            if (ok) ok = rowlet_try_release_a_frame();
+            if (ok) ok = rowlet_try_nickname_b_frame(bstep < 3u);
+            if (!ok) {
+                if (++v13_missing_hid > 600) rowlet_v13_halt();
+            } else {
+                v13_missing_hid = 0;
+            }
+            v13_frame++;
+        }
+        '''
+        wrapper=wrapper.replace('__OPEN__',str(opening)).replace('__WINDOW__',str(window))
+        m=replace_once(m,tick,wrapper+'\n'+tick,'install wrapper without replacing other code')
+
+        # Copy existing START injection approach; B only, never X.
+        bridge=r'''
+        // V22: short B press / release while A is fully released.
+        bool rowlet_try_nickname_b_frame(bool down)
+        {
+            if (!g_key_addr) return false;
+            volatile u32 *base = g_key_addr - (0x28 / 4);
+            u32 index = base[0x10 / 4];
+            if (index >= 8) return false;
+            volatile u32 *sample = base + (0x28 / 4) + index * (0x10 / 4);
+            u32 sample_pa = svcConvertVAToPA((const void *)sample, false);
+            u32 current_pa = svcConvertVAToPA((const void *)(base + (0x1c / 4)), false);
+            if (!sample_pa || !current_pa) return false;
+            volatile u32 *s = (volatile u32 *)(sample_pa | 0x80000000u);
+            volatile u32 *cur = (volatile u32 *)(current_pa | 0x80000000u);
+            if (down) {
+                s[0] = (s[0] & ~KEY_A) | KEY_B;
+                s[1] = (s[1] & ~KEY_A) | KEY_B;
+                *cur = (*cur & ~KEY_A) | KEY_B;
+            } else {
+                s[0] &= ~KEY_B;
+                s[1] &= ~KEY_B;
+                *cur &= ~KEY_B;
+            }
+            return true;
+        }
+        '''
+        if h.count('bool rowlet_try_nickname_start_frame(bool down)')!=1:
+            raise SystemExit('Proven START HID input helper missing')
+        if 'rowlet_try_nickname_b_frame' in h or 'rowlet_try_nickname_b_frame' in d:
+            raise SystemExit('B HID helper already present; refuse double install')
+        h+='\n'+bridge
+        d+='\n// V22 nickname B bridge\nbool rowlet_try_nickname_b_frame(bool down);\n'
+
+        # A shiny or a verified nonshiny must always release any synthetic B.
+        m,n=re.subn(r'(static void rowlet_v13_halt\(void\)\s*\{\s*)rowlet_try_release_a_frame\(\);',
+            r'\1rowlet_try_nickname_b_frame(false);\n    rowlet_try_release_a_frame();',m,count=1)
+        if n!=1:raise SystemExit('Could not attach B release on halt')
+        m,n=re.subn(r'(if\s*\(\s*v13_phase\s*==\s*4\s*\)\s*\{)',
+            r'\1\n            rowlet_try_nickname_b_frame(false);',m,count=1)
+        if n!=1:raise SystemExit('Could not attach B release on normal-only reset')
+
+        # Fail closed: ensure SD counter bodies and shiny/reset gates remain.
+        for x in ('static void rowlet_sd_load(void)','static void rowlet_sd_save(void)',
+                  'rowlet_sd_load();','rowlet_sd_save();',
+                  'if (v13_phase == 4)', 'if (v13_phase == 5 || v13_phase == 6)',
+                  'rowlet_v13_reset_sent', 'rowlet_try_soft_reset_frame(true)'):
+            if x not in m:raise SystemExit('Required preserved helper missing: '+x)
+        if 'KEY_X' in wrapper or 'KEY_X' in bridge:raise SystemExit('Unsafe X input')
+        main.write_text(m);hid.write_text(h);head.write_text(d)
+        print('V22 installed: normal hunter unchanged, %s A opening frames + %s B-only frames'%(opening,window))
+        PY
+    - name: Start A-mashing earlier after game boots (V22)
+      env:
+        STARTUP_DELAY_FRAMES: ${{ inputs.startup_a_delay_frames || '30' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        from pathlib import Path
+        import os
+        path = Path('3gx/sources/main.c')
+        code = path.read_text()
+        original = 'else if (++v13_boot_frames > 240) { // initial ~4 sec grace period'
+        frames = int(os.environ.get('STARTUP_DELAY_FRAMES', '30'))
+        if not 0 <= frames <= 240:
+            raise SystemExit('startup_a_delay_frames must be between 0 and 240')
+        if code.count(original) != 1:
+            raise SystemExit('Original 4-second startup delay anchor missing; refusing patch')
+        updated = f'else if (++v13_boot_frames > {frames}) {{ // V22 early title A start'
+        code = code.replace(original, updated, 1)
+        for required in ('static void rowlet_sd_load(void)',
+                         'static void rowlet_sd_save(void)',
+                         'if (v13_phase == 5 || v13_phase == 6)',
+                         'if (v13_phase == 4)',
+                         'rowlet_try_nickname_b_frame'):
+            if required not in code:
+                raise SystemExit('Required safety code missing: ' + required)
+        path.write_text(code)
+        print(f'V22 A-mashing startup delay: {frames} frames (was 240)')
+        PY
+    - name: Verify V22 keeps early A start, SD functions and shiny/reset safeguards
+      shell: bash
+      run: |
+        set -euo pipefail
+        grep -Fq 'static void rowlet_sd_load(void)' 3gx/sources/main.c
+        grep -Fq 'static void rowlet_sd_save(void)' 3gx/sources/main.c
+        grep -Fq 'rowlet_sd_save();' 3gx/sources/main.c
+        grep -Fq 'rowlet_try_nickname_b_frame(bstep < 3u)' 3gx/sources/main.c
+        grep -Fq 'rowlet_try_nickname_b_frame(bool down)' 3gx/sources/hid.c
+        grep -Fq 'rowlet_v22_original_a_pulse();' 3gx/sources/main.c
+        grep -Fq 'ROWLET: SHINY!' reader_core/src/gen7/frame.rs
+        grep -Fq 'if (v13_phase == 4)' 3gx/sources/main.c
+        grep -Fq 'if (v13_phase == 5 || v13_phase == 6)' 3gx/sources/main.c
+        grep -Fq 'rowlet_v13_reset_sent' reader_core/src/gen7/frame.rs
+        grep -Fq '(KEY_L | KEY_R | KEY_B)' 3gx/sources/main.c
+        grep -Fq 'KEY_L | KEY_R | KEY_START' 3gx/sources/hid.c
+        if grep -Fq 'rowlet_a_test_tick();' 3gx/sources/main.c; then
+            echo 'Old A test survived, refusing build' >&2; exit 1
+        fi
+        grep -Fq 'V22 early title A start' 3gx/sources/main.c
+        echo 'V22 early A source and preservation checks passed'
+    - name: Compile PokeReader V22 plugin
+      shell: bash
+      run: |
+        set -o pipefail
+        docker run --rm -v "$PWD:/work" -w /work zaksabeast/devkitarm-rust make 2>&1 | tee rowlet_v22_compile.log
+    - name: Upload experimental 3GX
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rowlet-v22-five-seconds-a-then-b
+        path: out/default.3gx
+        if-no-files-found: error
+    - name: Upload compile log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rowlet-v22-compile-log
+        path: rowlet_v22_compile.log
+        if-no-files-found: warn
